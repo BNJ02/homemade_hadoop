@@ -1,0 +1,18 @@
+La Cigale et le Serveur
+
+La cigale, ayant codé tout l’été,
+Se trouva fort dépourvue
+Quand la connexion fut venue :
+Pas un octet de message ou de donnée.
+Elle alla crier famine
+Chez le serveur son voisin,
+Le priant de lui prêter
+Quelque paquet pour subsister
+Jusqu’à la prochaine session.
+
+Le serveur, prudent et sage,
+Lui répondit sans ambages :
+« Que faisiez-vous au temps chaud ?
+— Nuit et jour à coder, tout beau !
+— Vous codiez ? J’en suis fort aise.
+Eh bien ! connectez maintenant. »
