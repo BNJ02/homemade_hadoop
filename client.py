@@ -1,3 +1,4 @@
+# client.py
 import socket
 import struct
 import sys
@@ -7,7 +8,9 @@ PORT = 5374
 
 def recv_all(sock, n):
     data = b""
+    # Lire exactement n octets
     while len(data) < n:
+        # Attendre la réception de données
         chunk = sock.recv(n - len(data))
         if not chunk:
             raise ConnectionError(
@@ -37,12 +40,15 @@ def client_worker(host):
         print(f"[{host}] Erreur : {e}")
 
 if __name__ == "__main__":
+    # Vérification des arguments
     if len(sys.argv) < 2:
         print("Usage: python client.py <HOST1> <HOST2> ...")
         sys.exit(1)
 
+    # Liste des hôtes à contacter
     hosts = sys.argv[1:]
 
+    # Lancer un thread pour chaque hôte
     threads = []
     for h in hosts:
         print(f"Démarrage du client pour {h}")
@@ -50,6 +56,7 @@ if __name__ == "__main__":
         t.start()
         threads.append(t)
 
+    # Attendre que tous les threads se terminent
     for t in threads:
         t.join()
     print("Tous les clients ont terminé.")

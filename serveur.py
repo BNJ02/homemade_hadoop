@@ -20,7 +20,9 @@ signal.signal(signal.SIGTERM, handle_stop)
 
 def recv_all(conn, n):
     data = b""
+    # Lire exactement n octets
     while len(data) < n:
+        # Attendre la réception de données
         packet = conn.recv(n - len(data))
         if not packet:
             return None
@@ -70,6 +72,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     else:
                         response = "inconnu"
 
+                    # Envoyer la réponse encodée
                     resp_bytes = response.encode()
                     conn.sendall(struct.pack(">I", len(resp_bytes)))
                     conn.sendall(resp_bytes)
