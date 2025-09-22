@@ -1,20 +1,23 @@
 import socket
 import struct
+import sys
 
-HOST = "tp-1a207-36"        # IP de la machine où tourne le serveur
-PORT = 5000                 # même port que dans le serveur
+if len(sys.argv) < 2:
+    print("Usage: python client.py <HOST>")
+    sys.exit(1)
+
+HOST = sys.argv[1]           # IP ou nom de la machine passée en argument
+PORT = 5000                  # même port que dans le serveur
 
 message = "bonjour".encode()
 msg_length = len(message)
 
-# Encode la taille sur 4 octets en big endian
-length_bytes = struct.pack(">I", msg_length)  # '>' = big endian, 'I' = unsigned int (4 bytes)
+length_bytes = struct.pack(">I", msg_length)
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.connect((HOST, PORT))
-    s.sendall(length_bytes)    # Envoie la taille
-    s.sendall(message)         # Envoie le message
-    # Réception de la réponse (même protocole : d'abord la taille, puis le message)
+    s.sendall(length_bytes)
+    s.sendall(message)
     resp_length_bytes = s.recv(4)
     resp_length = struct.unpack(">I", resp_length_bytes)[0]
     resp_data = b""
