@@ -1,12 +1,19 @@
 import socket
-import os
+import struct
 
-HOST = "0.0.0.0"   # écoute sur toutes les interfaces réseau
-PORT = 5000        # port choisi (>=1024) car pas administrateur
-FILENAME_TO_SEND = "poeme_lafontaine.txt"  # fichier à envoyer au client
-RECV_FILENAME = "fichier_recu_du_client.txt"  # nom du fichier reçu du client
+HOST = "0.0.0.0"
+PORT = 5000
 
-# Création du socket TCP
+def recv_all(conn, n):
+    """Lit exactement n octets depuis la connexion."""
+    data = b""
+    while len(data) < n:
+        packet = conn.recv(n - len(data))
+        if not packet:
+            return None
+        data += packet
+    return data
+
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.bind((HOST, PORT))
     s.listen(1)
@@ -15,36 +22,23 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     conn, addr = s.accept()
     with conn:
         print("Connecté par", addr)
-        # Réception du fichier du client
-        header = conn.recv(4096).decode()
-        if '|' not in header:
-            print("Erreur de réception du header du client.")
-            conn.close()
-            exit(1)
-        cli_filename, cli_filesize = header.split('|')
-        cli_filesize = int(cli_filesize)
-        conn.sendall(b"OK")
-        with open(RECV_FILENAME, "wb") as f:
-            total_received = 0
-            while total_received < cli_filesize:
-                chunk = conn.recv(min(4096, cli_filesize - total_received))
-                if not chunk:
-                    break
-                f.write(chunk)
-                total_received += len(chunk)
-        print(f"Fichier reçu du client et sauvegardé sous {RECV_FILENAME}.")
-
-        # Envoi du fichier poeme_lafontaine.txt au client
-        filesize = os.path.getsize(FILENAME_TO_SEND)
-        conn.sendall(f"{os.path.basename(FILENAME_TO_SEND)}|{filesize}".encode())
-        ack = conn.recv(2)
-        if ack != b"OK":
-            print("Erreur d'acknowledgement du client.")
-            exit(1)
-        with open(FILENAME_TO_SEND, "rb") as f:
-            while True:
-                bytes_read = f.read(4096)
-                if not bytes_read:
-                    break
-                conn.sendall(bytes_read)
-        print(f"Fichier {FILENAME_TO_SEND} envoyé au client.")
+        # 1. Lire d'abord 4 octets pour la taille
+        raw_size = recv_all(conn, 4)
+        if raw_size is None:
+            print("Erreur lors de la réception de la taille.")
+        else:
+            # 2. Décoder la taille avec struct
+            msg_size = struct.unpack(">I", raw_size)[0]
+            print(f"Taille du message à recevoir : {msg_size} octets")
+            # 3. Lire le message complet
+            msg_data = recv_all(conn, msg_size)
+            if msg_data is None:
+                print("Erreur lors de la réception du message.")
+            else:
+                print("Reçu :", msg_data.decode())
+                # 4. Réponse (exemple : "salut")
+                response = "salut".encode()
+                resp_size = len(response)
+                # Encoder la taille avec struct
+                conn.sendall(struct.pack(">I", resp_size))
+                conn.sendall(response)
