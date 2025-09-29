@@ -3,8 +3,11 @@ import socket
 import struct
 import sys
 import threading
+from time import sleep
 
 PORT = 5374
+
+count = 0  # Variable globale sans protection
 
 def recv_all(sock, n):
     data = b""
@@ -20,6 +23,7 @@ def recv_all(sock, n):
     return data
 
 def client_worker(host):
+    global count
     message = b"bonjour"
     length_bytes = struct.pack(">I", len(message))
 
@@ -34,6 +38,14 @@ def client_worker(host):
                 resp_length_bytes = recv_all(s, 4)
                 resp_length = struct.unpack(">I", resp_length_bytes)[0]
                 resp_data = recv_all(s, resp_length)
+
+                # PROBLÈME : Opération non-atomique sans protection
+                temp = count          # 1. Lire la valeur actuelle
+                sleep(0.00000001)  # Simuler un petit délai pour augmenter les chances de collision
+                temp = temp + 1       # 2. Calculer la nouvelle valeur
+                sleep(0.00000001)  # Simuler un petit délai pour augmenter les chances de collision
+                count = temp          # 3. Écrire la nouvelle valeur
+                # count += 1  # Incrémentation sans protection
 
             print(f"[{host}] Terminé, dernière réponse = {resp_data.decode()}")
     except Exception as e:
@@ -60,3 +72,4 @@ if __name__ == "__main__":
     for t in threads:
         t.join()
     print("Tous les clients ont terminé.")
+    print(f"Valeur finale de count = {count}")
