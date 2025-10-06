@@ -13,6 +13,14 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+"""Worker client for the distributed MapReduce wordcount demo.
+
+Chaque worker se connecte au master pour recevoir les ordres START_MAP et
+START_REDUCE. La phase map lit split_<id>.txt et répartit les mots via une
+fonction de hachage MD5%N. Les messages arrivent en parallèle via un thread
+"shuffle" dédié et sont cumulés pour la réduction locale.
+"""
+
 WORD_RE = re.compile(r"\w+")
 
 
@@ -45,7 +53,10 @@ class MapReduceClient:
         self._listener_thread: Optional[threading.Thread] = None
         self._master_socket: Optional[socket.socket] = None
 
+    # Boucle principale du client
     def start(self) -> None:
+        # Démarre l'écoute shuffle avant d'informer le master pour garantir
+        # que les autres workers peuvent nous pousser des clés immédiatement.
         self._start_shuffle_listener()
         self._connect_master()
         try:
@@ -57,7 +68,10 @@ class MapReduceClient:
                 self._master_socket.close()
             self._poke_listener()
 
+    # Démarre le thread d'écoute pour la phase shuffle.
     def _start_shuffle_listener(self) -> None:
+        # Thread d'écoute asynchrone pour recevoir les paires (mot, 1)
+        # qui nous sont destinées pendant la phase map des autres workers.
         def run_listener() -> None:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
                 server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -78,7 +92,9 @@ class MapReduceClient:
         self._listener_thread = threading.Thread(target=run_listener, daemon=True)
         self._listener_thread.start()
 
+    # Force la terminaison du thread d'écoute.
     def _poke_listener(self) -> None:
+        # Force accept() à sortir pour que le thread se termine proprement.
         try:
             with socket.create_connection(("127.0.0.1", self.shuffle_port), timeout=0.5):
                 pass
@@ -87,6 +103,7 @@ class MapReduceClient:
         if self._listener_thread is not None:
             self._listener_thread.join(timeout=1.0)
 
+    # Connexion au master et enregistrement
     def _connect_master(self) -> None:
         self._master_socket = socket.create_connection((self.master_host, self.control_port))
         self._master_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -98,6 +115,7 @@ class MapReduceClient:
         }
         self._send_control(register_payload)
 
+    # Boucle principale de contrôle pour recevoir les ordres du master.
     def _control_loop(self) -> None:
         assert self._master_socket is not None
         while not self._shutdown_event.is_set():
@@ -135,8 +153,10 @@ class MapReduceClient:
                     file=sys.stderr,
                 )
 
+    # Lit le split local et envoie les mots aux autres workers.
     def _run_map_stage(self) -> Tuple[bool, Optional[str]]:
         try:
+            # Vider d'abord les accumulations pour ne pas mélanger deux jobs.
             with self._incoming_lock:
                 self._incoming_counts.clear()
             path = Path(f"split_{self.split_id}.txt")
@@ -146,21 +166,24 @@ class MapReduceClient:
                 destination = self._hash_to_index(word)
                 self._send_word(destination, word)
             return True, None
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             return False, str(exc)
         finally:
             self._close_outgoing()
 
+    # Réduit les paires (mot, count) accumulées localement.
     def _run_reduce_stage(self) -> Tuple[Optional[List[Tuple[str, int]]], Optional[str]]:
         try:
             with self._incoming_lock:
                 snapshot = list(self._incoming_counts.items())
             snapshot.sort()
             return snapshot, None
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             return None, str(exc)
 
+    # Itère sur les mots dans le fichier split.
     def _iter_words(self, path: Path) -> Iterable[str]:
+        # Extraction naïve des tokens alphanumériques pour le wordcount.
         with path.open("r", encoding=self.encoding) as handle:
             for line in handle:
                 for raw_word in WORD_RE.findall(line.lower()):
@@ -168,11 +191,13 @@ class MapReduceClient:
                     if word:
                         yield word
 
+    # Fonction de hachage MD5 pour répartir les mots entre workers.
     def _hash_to_index(self, word: str) -> int:
         digest = hashlib.md5(word.encode(self.encoding)).digest()
         value = int.from_bytes(digest, byteorder="big")
         return value % len(self.hosts)
 
+    # Envoie un mot à un autre worker (ou à soi-même).
     def _send_word(self, destination: int, word: str) -> None:
         if destination == self.machine_index:
             with self._incoming_lock:
@@ -182,6 +207,7 @@ class MapReduceClient:
         payload = word.encode(self.encoding)
         self._send_frame(sock, payload)
 
+    # Obtient (ou crée) une connexion socket vers un autre worker.
     def _get_outgoing_socket(self, destination: int) -> socket.socket:
         sock = self._outgoing_sockets.get(destination)
         if sock is not None:
@@ -200,6 +226,7 @@ class MapReduceClient:
         self._outgoing_sockets[destination] = sock
         return sock
 
+    # Ferme toutes les connexions sortantes.
     def _close_outgoing(self) -> None:
         for sock in self._outgoing_sockets.values():
             try:
@@ -209,6 +236,7 @@ class MapReduceClient:
             sock.close()
         self._outgoing_sockets.clear()
 
+    # Consomme un flux de paires (mot, 1) en provenance d'un autre worker.
     def _consume_shuffle_stream(self, conn: socket.socket) -> None:
         with conn:
             while not self._shutdown_event.is_set():
@@ -225,10 +253,12 @@ class MapReduceClient:
                 with self._incoming_lock:
                     self._incoming_counts[word] += 1
 
+    # Envoi de données avec un en-tête de taille
     def _send_frame(self, sock: socket.socket, payload: bytes) -> None:
         header = struct.pack(">I", len(payload))
         sock.sendall(header + payload)
 
+    # Réception de données exactes
     def _recv_exact(self, sock: socket.socket, size: int) -> Optional[bytes]:
         data = b""
         while len(data) < size:
@@ -241,11 +271,13 @@ class MapReduceClient:
             data += chunk
         return data
 
+    # Envoi des messages de contrôle au master
     def _send_control(self, payload: Dict[str, object]) -> None:
         assert self._master_socket is not None
         data = json.dumps(payload).encode(self.encoding)
         self._send_frame(self._master_socket, data)
 
+    # Réception des messages de contrôle du master
     def _recv_control(self) -> Optional[Dict[str, object]]:
         assert self._master_socket is not None
         length_bytes = self._recv_exact(self._master_socket, 4)
@@ -257,7 +289,7 @@ class MapReduceClient:
             return None
         return json.loads(payload.decode(self.encoding))
 
-
+# Analyse des arguments de la ligne de commande
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MapReduce wordcount client")
     parser.add_argument("worker_id", type=int, help="One-based worker identifier")
@@ -300,7 +332,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+### Point d'entrée principal ###
+if __name__ == "__main__":
     args = parse_args()
     hosts = args.hosts
     worker_id = args.worker_id
@@ -322,10 +355,6 @@ def main() -> None:
     )
     try:
         client.start()
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=broad-except
         print(f"Client terminated with error: {exc}", file=sys.stderr)
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

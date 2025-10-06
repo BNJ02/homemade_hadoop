@@ -8,8 +8,17 @@ import struct
 import threading
 from typing import Dict, Optional, Tuple
 
+"""Master node orchestration for the MapReduce wordcount demo.
 
+Le master accepte les connexions de contrôle des workers, diffuse les
+ordres de démarrage des phases map et reduce, agrège les résultats et
+assure un arrêt coordonné.
+"""
+
+# Informations par client connecté.
 class ClientInfo:
+    """Métadonnées par worker : socket, adresse et informations déclarées."""
+
     def __init__(self, sock: socket.socket, addr: Tuple[str, int]) -> None:
         self.sock = sock
         self.addr = addr
@@ -18,7 +27,7 @@ class ClientInfo:
         self.split_id: Optional[str] = None
         self.shuffle_port: Optional[int] = None
 
-
+# Lit exactement `size` octets depuis le socket, ou None si la connexion est fermée.
 def recv_exact(sock: socket.socket, size: int) -> Optional[bytes]:
     data = b""
     while len(data) < size:
@@ -28,7 +37,7 @@ def recv_exact(sock: socket.socket, size: int) -> Optional[bytes]:
         data += chunk
     return data
 
-
+# Lit un message JSON préfixé par sa taille (4 bytes big-endian).
 def recv_json(sock: socket.socket) -> Optional[Dict[str, object]]:
     length_bytes = recv_exact(sock, 4)
     if not length_bytes:
@@ -39,13 +48,13 @@ def recv_json(sock: socket.socket) -> Optional[Dict[str, object]]:
         return None
     return json.loads(payload.decode("utf-8"))
 
-
+# Envoie un message JSON préfixé par sa taille (4 bytes big-endian).
 def send_json(sock: socket.socket, payload: Dict[str, object]) -> None:
     data = json.dumps(payload).encode("utf-8")
     header = struct.pack(">I", len(data))
     sock.sendall(header + data)
 
-
+# Serveur principal orchestrant les phases map/reduce.
 class MasterServer:
     def __init__(self, host: str, port: int, expected_workers: int) -> None:
         self.host = host
@@ -61,7 +70,9 @@ class MasterServer:
         self._start_map_sent = False
         self._start_reduce_sent = False
 
+    # Démarre le serveur et gère la boucle principale.
     def start(self) -> None:
+        # Thread d'acceptation séparé pour ne pas bloquer la boucle principale.
         accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         accept_thread.start()
         try:
@@ -76,6 +87,7 @@ class MasterServer:
             accept_thread.join(timeout=2.0)
             self._close_all_clients()
 
+    # Boucle d'acceptation des connexions entrantes.
     def _accept_loop(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
             server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -90,6 +102,7 @@ class MasterServer:
                 info = ClientInfo(conn, addr)
                 threading.Thread(target=self._handle_client, args=(info,), daemon=True).start()
 
+    # Gère la communication avec un client connecté.
     def _handle_client(self, info: ClientInfo) -> None:
         sock = info.sock
         try:
@@ -105,6 +118,7 @@ class MasterServer:
                     self._clients.pop(info.machine_index, None)
                 self._condition.notify_all()
 
+    # Traite un message reçu d'un client.
     def _process_message(self, info: ClientInfo, message: Dict[str, object]) -> None:
         msg_type = message.get("type")
         if msg_type == "register":
@@ -151,13 +165,16 @@ class MasterServer:
         else:
             print(f"Unknown message from {info.addr}: {message}")
 
+    # Boucle de coordination principale.
     def _coordinate(self) -> None:
+        # Boucle principale : bloquée sur la condition tant que des événements
+        # (inscription, fin de map/reduce) ne sont pas reçus.
         while not self._stop_event.is_set():
             with self._condition:
                 if not self._start_map_sent and len(self._clients) >= self.expected_workers:
                     self._broadcast({"type": "start_map"})
                     self._start_map_sent = True
-                    print("All workers registered. start_map sent.")
+                    print("\nAll workers registered. start_map sent.")
                     continue
                 if (
                     self._start_map_sent
@@ -166,7 +183,7 @@ class MasterServer:
                 ):
                     self._broadcast({"type": "start_reduce"})
                     self._start_reduce_sent = True
-                    print("All map_finished received. start_reduce sent.")
+                    print("\nAll map_finished received. start_reduce sent.")
                     continue
                 if (
                     self._start_reduce_sent
@@ -178,6 +195,7 @@ class MasterServer:
                     return
                 self._condition.wait()
 
+    # Diffuse un message à tous les clients connectés.
     def _broadcast(self, payload: Dict[str, object]) -> None:
         for index, info in list(self._clients.items()):
             try:
@@ -188,15 +206,17 @@ class MasterServer:
                 info.sock.close()
                 self._clients.pop(index, None)
 
+    # Agrège et affiche les résultats finaux du wordcount.
     def _emit_final_result(self) -> None:
         final_counts = collections.Counter()
         for partial in self._reduce_results.values():
             for word, count in partial.items():
                 final_counts[word] += count
-        print("Final wordcount:")
+        print("\nFinal wordcount:")
         for word, count in final_counts.most_common():
             print(f"{word}: {count}")
 
+    # Ferme toutes les connexions clients.
     def _close_all_clients(self) -> None:
         for info in list(self._clients.values()):
             try:
@@ -205,7 +225,7 @@ class MasterServer:
                 pass
         self._clients.clear()
 
-
+# Analyse les arguments de la ligne de commande.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MapReduce master server")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address for the master")
@@ -218,7 +238,7 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-### Entry point ###
+### Point d'entrée principal. ###
 if __name__ == "__main__":
     args = parse_args()
     server = MasterServer(host=args.host, port=args.port, expected_workers=args.num_workers)
