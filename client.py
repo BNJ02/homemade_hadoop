@@ -9,13 +9,14 @@ PORT = 5374
 count = 0
 count_lock = threading.Lock()
 
-def recv_all(sock, n):
+
+def recv_all(sock, expected):
     data = b""
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
+    while len(data) < expected:
+        chunk = sock.recv(expected - len(data))
         if not chunk:
             raise ConnectionError(
-                f"Connexion fermée par le serveur (attendu {n} octets, reçu {len(data)})"
+                f"Connexion fermee par le serveur (attendu {expected} octets, recu {len(data)})"
             )
         data += chunk
     return data
@@ -23,25 +24,28 @@ def recv_all(sock, n):
 def client_worker(host):
     global count
     message = b"bonjour"
-    length_bytes = struct.pack(">I", len(message))
+    payload = struct.pack(">I", len(message)) + message
+    local_count = 0
+    last_response = b""
 
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((host, PORT))
-            for _ in range(1000):
-                s.sendall(length_bytes)
-                s.sendall(message)
+        with socket.create_connection((host, PORT)) as sock:
+            for _ in range(100000):
+                sock.sendall(payload)
 
-                resp_length_bytes = recv_all(s, 4)
+                resp_length_bytes = recv_all(sock, 4)
                 resp_length = struct.unpack(">I", resp_length_bytes)[0]
-                resp_data = recv_all(s, resp_length)
+                resp_data = recv_all(sock, resp_length)
 
-                with count_lock:
-                    count += 1
+                last_response = resp_data
+                local_count += 1
 
-            print(f"[{host}] Terminé, dernière réponse = {resp_data.decode()}")
-    except Exception as e:
-        print(f"[{host}] Erreur : {e}")
+        with count_lock:
+            count += local_count
+        print(f"[{host}] Termine, derniere reponse = {last_response.decode()}")
+    except Exception as exc:
+        print(f"[{host}] Erreur : {exc}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -50,13 +54,13 @@ if __name__ == "__main__":
 
     hosts = sys.argv[1:]
     threads = []
-    for h in hosts:
-        print(f"Démarrage du client pour {h}")
-        t = threading.Thread(target=client_worker, args=(h,))
-        t.start()
-        threads.append(t)
+    for host in hosts:
+        print(f"Demarrage du client pour {host}")
+        thread = threading.Thread(target=client_worker, args=(host,))
+        thread.start()
+        threads.append(thread)
 
-    for t in threads:
-        t.join()
-    print("Tous les clients ont terminé.")
+    for thread in threads:
+        thread.join()
+    print("Tous les clients ont termine.")
     print(f"Valeur finale de count = {count}")
