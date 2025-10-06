@@ -1,66 +1,331 @@
-# client.py
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import re
 import socket
 import struct
 import sys
 import threading
+import time
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
-PORT = 5374
-
-count = 0
-count_lock = threading.Lock()
+WORD_RE = re.compile(r"\w+")
 
 
-def recv_all(sock, expected):
-    data = b""
-    while len(data) < expected:
-        chunk = sock.recv(expected - len(data))
-        if not chunk:
-            raise ConnectionError(
-                f"Connexion fermee par le serveur (attendu {expected} octets, recu {len(data)})"
-            )
-        data += chunk
-    return data
+class MapReduceClient:
+    def __init__(
+        self,
+        machine_index: int,
+        worker_id: int,
+        split_id: str,
+        hosts: Iterable[str],
+        master_host: str,
+        control_port: int,
+        shuffle_port_base: int,
+        encoding: str,
+    ) -> None:
+        self.machine_index = machine_index
+        self.worker_id = worker_id
+        self.split_id = split_id
+        self.hosts = list(hosts)
+        self.master_host = master_host
+        self.control_port = control_port
+        self.shuffle_base_port = shuffle_port_base
+        self.shuffle_port = shuffle_port_base + machine_index
+        self.encoding = encoding
 
-def client_worker(host):
-    global count
-    message = b"bonjour"
-    payload = struct.pack(">I", len(message)) + message
-    local_count = 0
-    last_response = b""
+        self._incoming_counts = collections.Counter()
+        self._incoming_lock = threading.Lock()
+        self._shutdown_event = threading.Event()
+        self._outgoing_sockets: Dict[int, socket.socket] = {}
+        self._listener_thread: Optional[threading.Thread] = None
+        self._master_socket: Optional[socket.socket] = None
 
+    def start(self) -> None:
+        self._start_shuffle_listener()
+        self._connect_master()
+        try:
+            self._control_loop()
+        finally:
+            self._shutdown_event.set()
+            self._close_outgoing()
+            if self._master_socket is not None:
+                self._master_socket.close()
+            self._poke_listener()
+
+    def _start_shuffle_listener(self) -> None:
+        def run_listener() -> None:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
+                server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_sock.bind(("0.0.0.0", self.shuffle_port))
+                server_sock.listen()
+                server_sock.settimeout(1.0)
+                while not self._shutdown_event.is_set():
+                    try:
+                        conn, _ = server_sock.accept()
+                    except socket.timeout:
+                        continue
+                    threading.Thread(
+                        target=self._consume_shuffle_stream,
+                        args=(conn,),
+                        daemon=True,
+                    ).start()
+
+        self._listener_thread = threading.Thread(target=run_listener, daemon=True)
+        self._listener_thread.start()
+
+    def _poke_listener(self) -> None:
+        try:
+            with socket.create_connection(("127.0.0.1", self.shuffle_port), timeout=0.5):
+                pass
+        except OSError:
+            pass
+        if self._listener_thread is not None:
+            self._listener_thread.join(timeout=1.0)
+
+    def _connect_master(self) -> None:
+        self._master_socket = socket.create_connection((self.master_host, self.control_port))
+        self._master_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        register_payload = {
+            "type": "register",
+            "machine_index": self.worker_id,
+            "split_id": self.split_id,
+            "shuffle_port": self.shuffle_port,
+        }
+        self._send_control(register_payload)
+
+    def _control_loop(self) -> None:
+        assert self._master_socket is not None
+        while not self._shutdown_event.is_set():
+            message = self._recv_control()
+            if message is None:
+                break
+            msg_type = message.get("type")
+            if msg_type == "start_map":
+                status, error = self._run_map_stage()
+                payload = {
+                    "type": "map_finished",
+                    "machine_index": self.worker_id,
+                    "success": status,
+                }
+                if error is not None:
+                    payload["error"] = error
+                self._send_control(payload)
+            elif msg_type == "start_reduce":
+                results, error = self._run_reduce_stage()
+                payload = {
+                    "type": "reduce_finished",
+                    "machine_index": self.worker_id,
+                    "success": error is None,
+                }
+                if results is not None:
+                    payload["results"] = results
+                if error is not None:
+                    payload["error"] = error
+                self._send_control(payload)
+            elif msg_type == "shutdown":
+                break
+            else:
+                print(
+                    f"[worker {self.worker_id}] Unknown control message: {message}",
+                    file=sys.stderr,
+                )
+
+    def _run_map_stage(self) -> Tuple[bool, Optional[str]]:
+        try:
+            with self._incoming_lock:
+                self._incoming_counts.clear()
+            path = Path(f"split_{self.split_id}.txt")
+            if not path.exists():
+                raise FileNotFoundError(f"split file missing: {path}")
+            for word in self._iter_words(path):
+                destination = self._hash_to_index(word)
+                self._send_word(destination, word)
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            self._close_outgoing()
+
+    def _run_reduce_stage(self) -> Tuple[Optional[List[Tuple[str, int]]], Optional[str]]:
+        try:
+            with self._incoming_lock:
+                snapshot = list(self._incoming_counts.items())
+            snapshot.sort()
+            return snapshot, None
+        except Exception as exc:
+            return None, str(exc)
+
+    def _iter_words(self, path: Path) -> Iterable[str]:
+        with path.open("r", encoding=self.encoding) as handle:
+            for line in handle:
+                for raw_word in WORD_RE.findall(line.lower()):
+                    word = raw_word.strip()
+                    if word:
+                        yield word
+
+    def _hash_to_index(self, word: str) -> int:
+        digest = hashlib.md5(word.encode(self.encoding)).digest()
+        value = int.from_bytes(digest, byteorder="big")
+        return value % len(self.hosts)
+
+    def _send_word(self, destination: int, word: str) -> None:
+        if destination == self.machine_index:
+            with self._incoming_lock:
+                self._incoming_counts[word] += 1
+            return
+        sock = self._get_outgoing_socket(destination)
+        payload = word.encode(self.encoding)
+        self._send_frame(sock, payload)
+
+    def _get_outgoing_socket(self, destination: int) -> socket.socket:
+        sock = self._outgoing_sockets.get(destination)
+        if sock is not None:
+            return sock
+        host = self.hosts[destination]
+        port = self.shuffle_base_port + destination
+        for attempt in range(5):
+            try:
+                sock = socket.create_connection((host, port), timeout=5.0)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._outgoing_sockets[destination] = sock
+        return sock
+
+    def _close_outgoing(self) -> None:
+        for sock in self._outgoing_sockets.values():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        self._outgoing_sockets.clear()
+
+    def _consume_shuffle_stream(self, conn: socket.socket) -> None:
+        with conn:
+            while not self._shutdown_event.is_set():
+                length_bytes = self._recv_exact(conn, 4)
+                if not length_bytes:
+                    break
+                size = struct.unpack(">I", length_bytes)[0]
+                payload = self._recv_exact(conn, size)
+                if not payload:
+                    break
+                word = payload.decode(self.encoding)
+                if not word:
+                    continue
+                with self._incoming_lock:
+                    self._incoming_counts[word] += 1
+
+    def _send_frame(self, sock: socket.socket, payload: bytes) -> None:
+        header = struct.pack(">I", len(payload))
+        sock.sendall(header + payload)
+
+    def _recv_exact(self, sock: socket.socket, size: int) -> Optional[bytes]:
+        data = b""
+        while len(data) < size:
+            try:
+                chunk = sock.recv(size - len(data))
+            except socket.timeout:
+                continue
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    def _send_control(self, payload: Dict[str, object]) -> None:
+        assert self._master_socket is not None
+        data = json.dumps(payload).encode(self.encoding)
+        self._send_frame(self._master_socket, data)
+
+    def _recv_control(self) -> Optional[Dict[str, object]]:
+        assert self._master_socket is not None
+        length_bytes = self._recv_exact(self._master_socket, 4)
+        if not length_bytes:
+            return None
+        size = struct.unpack(">I", length_bytes)[0]
+        payload = self._recv_exact(self._master_socket, size)
+        if not payload:
+            return None
+        return json.loads(payload.decode(self.encoding))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="MapReduce wordcount client")
+    parser.add_argument("worker_id", type=int, help="One-based worker identifier")
+    parser.add_argument(
+        "hosts",
+        nargs="+",
+        help="Ordered list of worker hostnames (including this machine)",
+    )
+    parser.add_argument(
+        "--split-id",
+        dest="split_id",
+        help="Suffix used for split_<id>.txt (defaults to worker_id)",
+    )
+    parser.add_argument(
+        "--master-host",
+        dest="master_host",
+        default="tp-1a207-37",
+        help="Hostname of the master node",
+    )
+    parser.add_argument(
+        "--control-port",
+        dest="control_port",
+        type=int,
+        default=5374,
+        help="TCP port for the control plane",
+    )
+    parser.add_argument(
+        "--shuffle-port-base",
+        dest="shuffle_port_base",
+        type=int,
+        default=6200,
+        help="Base port for the shuffle phase",
+    )
+    parser.add_argument(
+        "--encoding",
+        dest="encoding",
+        default="utf-8",
+        help="Text encoding for split files",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    hosts = args.hosts
+    worker_id = args.worker_id
+    num_hosts = len(hosts)
+    if worker_id < 1 or worker_id > num_hosts:
+        print("worker_id must be between 1 and the number of hosts", file=sys.stderr)
+        sys.exit(1)
+    machine_index = worker_id - 1
+    split_id = args.split_id or str(worker_id)
+    client = MapReduceClient(
+        machine_index=machine_index,
+        worker_id=worker_id,
+        split_id=split_id,
+        hosts=hosts,
+        master_host=args.master_host,
+        control_port=args.control_port,
+        shuffle_port_base=args.shuffle_port_base,
+        encoding=args.encoding,
+    )
     try:
-        with socket.create_connection((host, PORT)) as sock:
-            for _ in range(100000):
-                sock.sendall(payload)
-
-                resp_length_bytes = recv_all(sock, 4)
-                resp_length = struct.unpack(">I", resp_length_bytes)[0]
-                resp_data = recv_all(sock, resp_length)
-
-                last_response = resp_data
-                local_count += 1
-
-        with count_lock:
-            count += local_count
-        print(f"[{host}] Termine, derniere reponse = {last_response.decode()}")
+        client.start()
     except Exception as exc:
-        print(f"[{host}] Erreur : {exc}")
+        print(f"Client terminated with error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python client.py <HOST1> <HOST2> ...")
-        sys.exit(1)
-
-    hosts = sys.argv[1:]
-    threads = []
-    for host in hosts:
-        print(f"Demarrage du client pour {host}")
-        thread = threading.Thread(target=client_worker, args=(host,))
-        thread.start()
-        threads.append(thread)
-
-    for thread in threads:
-        thread.join()
-    print("Tous les clients ont termine.")
-    print(f"Valeur finale de count = {count}")
+    main()
