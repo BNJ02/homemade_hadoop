@@ -11,9 +11,9 @@ Ce dépôt montre une version simplifiée d'un traitement MapReduce de type
 - `client.py` (worker) : chaque instance se connecte au master, expose un
   écouteur "shuffle" dédié et exécute la phase map puis la réduction pour
   les clés qui lui reviennent.
-- `Bonjour_a_3_machines.sh` / `map_reduce.sh` : scripts d'orchestration qui
-  démarrent le master (tp-1a207-37) puis les trois workers
-  (tp-1a207-34..36) en tâche de fond.
+- `map_reduce.sh` : scripts d'orchestration qui
+  démarrent le master (tp-4b01-00) puis les trois workers
+  (tp-4b01-01..03) en tâche de fond.
 - `split_<id>.txt` : fichiers d'entrée déjà partitionnés côté workers. Le
   worker `i` (1-based) lit `split_i.txt`.
 
@@ -42,9 +42,9 @@ Ce dépôt montre une version simplifiée d'un traitement MapReduce de type
 
 1. Copier `serveur.py` sur `tp-1a207-37` et `client.py` ainsi que
    `split_i.txt` sur chaque worker. Vérifier la présence de Python 3.
-2. Depuis la machine de pilotage, exécuter `./Bonjour_a_3_machines.sh` (ou
-   `map_reduce.sh` si vous préférez). Le script ouvre le master en tâche de
-   fond puis chaque worker avec l'identifiant adéquat (1..N).
+2. Depuis la machine de pilotage, exécuter `./map_reduce.sh`.
+  Le script ouvre le master en tâche de fond puis chaque worker
+  avec l'identifiant adéquat (1..N).
 3. Suivre la progression via `ssh tp-1a207-37 'tail -f ~/mapreduce_master.log'`
    et `ssh tp-1a207-3x 'tail -f ~/mapreduce_worker_i.log'`.
 4. À la fin, le master affiche « Final wordcount » avec le total consolidé.
