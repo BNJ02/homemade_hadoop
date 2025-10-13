@@ -2,8 +2,8 @@
 set -euo pipefail   # Quitte si erreur, variable non définie ou échec de pipeline
 
 USER=blepourt-25
-MASTER="tp-4b01-00"
-WORKERS=(tp-4b01-01 tp-4b01-02 tp-4b01-03)
+MASTER="tp-4b01-10"
+WORKERS=(tp-4b01-11 tp-4b01-12 tp-4b01-13 tp-4b01-14 tp-4b01-15 tp-4b01-16 tp-4b01-17 tp-4b01-18 tp-4b01-19 tp-4b01-20)
 CONTROL_PORT=5374
 SHUFFLE_BASE=6200
 
