@@ -106,6 +106,7 @@ done
 ## 🔍 Vérifier l'état
 
 ### Processus en cours
+
 ```powershell
 # Sur le master
 ssh blepourt-25@tp-4b01-10 'ps aux | grep serveur.py'
@@ -115,6 +116,7 @@ ssh blepourt-25@tp-4b01-11 'ps aux | grep client.py'
 ```
 
 ### Ports ouverts
+
 ```powershell
 # Master (port de contrôle 5374)
 ssh blepourt-25@tp-4b01-10 'netstat -tlnp | grep 5374'
@@ -127,7 +129,7 @@ ssh blepourt-25@tp-4b01-11 'netstat -tlnp | grep 6200'
 
 ## 📋 Architecture
 
-```
+```bash
 Master: tp-4b01-10
   - Port de contrôle: 5374
   - Fichiers: serveur.py, split_1.txt à split_10.txt
@@ -151,7 +153,7 @@ Workers:
 
 Le log du master affichera :
 
-```
+```bash
 Worker 1 registered from ('x.x.x.x', xxxx)
 Worker 2 registered from ('x.x.x.x', xxxx)
 ...

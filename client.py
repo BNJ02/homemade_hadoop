@@ -159,7 +159,13 @@ class MapReduceClient:
             # Vider d'abord les accumulations pour ne pas mélanger deux jobs.
             with self._incoming_lock:
                 self._incoming_counts.clear()
-            path = Path(f"split_{self.split_id}.txt")
+            
+            # If split_id contains a path separator, use it as-is, otherwise use split_X.txt format
+            if "/" in self.split_id:
+                path = Path(self.split_id)
+            else:
+                path = Path(f"split_{self.split_id}.txt")
+            
             if not path.exists():
                 raise FileNotFoundError(f"split file missing: {path}")
             for word in self._iter_words(path):

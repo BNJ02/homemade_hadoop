@@ -5,14 +5,16 @@ set -euo pipefail
 # and optionally run it multiple times for benchmarking.
 #
 # Usage:
-#   ./run_cluster.sh [--runs N] [--wait] [--output FILE] [--workers HOST1,HOST2,...]
+#   ./run_cluster.sh [--runs N] [--wait] [--output FILE] [--workers HOST1,HOST2,...] [--warc]
 #
 # Options:
 #   --runs N              Number of times to run the job (default: 1)
 #   --wait                Wait for job completion and show results after each run
 #   --output FILE         Save output to specified file (in addition to console)
-#   --workers HOST1,...   Comma-separated list of worker hosts (worker i gets split_i.txt)
+#   --workers HOST1,...   Comma-separated list of worker hosts (worker i processes file i)
 #   --master HOST         Master hostname (default: tp-4b01-10)
+#   --warc                Use Common Crawl WARC files (0000X.warc.wet) instead of split_X.txt
+#   --warc-dir DIR        Directory containing WARC files (default: /cal/commoncrawl)
 #   --help                Show this help message
 #
 # Environment overrides:
@@ -27,6 +29,8 @@ WAIT_FOR_COMPLETION=false
 OUTPUT_FILE=""
 WORKERS_ARG=""
 MASTER_ARG=""
+USE_WARC=false
+WARC_DIR="/cal/commoncrawl"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -65,6 +69,19 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --master requires a hostname" >&2
                 exit 1
             fi
+            shift 2
+            ;;
+        --warc)
+            USE_WARC=true
+            shift
+            ;;
+        --warc-dir)
+            WARC_DIR="${2:-}"
+            if [[ -z "$WARC_DIR" ]]; then
+                echo "Error: --warc-dir requires a directory path" >&2
+                exit 1
+            fi
+            USE_WARC=true
             shift 2
             ;;
         --help|-h)
@@ -128,14 +145,26 @@ log_output "Workers:      ${WORKERS_ARRAY[0]} ... ${WORKERS_ARRAY[-1]} ($NUM_WOR
 log_output "Runs:         $RUNS"
 log_output "Control port: $CONTROL_PORT"
 log_output "Shuffle base: $SHUFFLE_BASE"
+if [[ "$USE_WARC" == true ]]; then
+    log_output "Input mode:   Common Crawl WARC files"
+    log_output "WARC dir:     $WARC_DIR"
+else
+    log_output "Input mode:   Split files (split_X.txt)"
+fi
 if [[ -n "$OUTPUT_FILE" ]]; then
     log_output "Output file:  $OUTPUT_FILE"
 fi
 log_output ""
-log_output "Worker → Split mapping:"
+log_output "Worker → Input file mapping:"
 for i in "${!WORKERS_ARRAY[@]}"; do
     worker_num=$((i + 1))
-    log_output "  Worker $worker_num (${WORKERS_ARRAY[$i]}) → split_${worker_num}.txt"
+    file_index=$i
+    if [[ "$USE_WARC" == true ]]; then
+        file_name=$(printf "CC-MAIN-20230320083513-20230320113513-%05d.warc.wet" $file_index)
+        log_output "  Worker $worker_num (${WORKERS_ARRAY[$i]}) → $WARC_DIR/$file_name"
+    else
+        log_output "  Worker $worker_num (${WORKERS_ARRAY[$i]}) → ~/split_${worker_num}.txt"
+    fi
 done
 log_output "=============================================="
 log_output ""
@@ -235,13 +264,24 @@ launch_cluster() {
     
     log_output "[$run_label] Master started successfully"
     
-    # Launch workers - worker i automatically processes split_i.txt
+    # Launch workers
     local worker_id=1
+    local worker_index=0
     for worker in "${WORKERS_ARRAY[@]}"; do
-        log_output "[$run_label] Launching worker ${worker_id} on ${worker} (processes split_${worker_id}.txt)..."
-        ssh "$worker" \
-            "nohup python3 ~/client.py ${worker_id} ${WORKERS} --master-host ${MASTER} --control-port ${CONTROL_PORT} --shuffle-port-base ${SHUFFLE_BASE} > ~/mapreduce_worker_${worker_id}.log 2>&1 &" &
+        if [[ "$USE_WARC" == true ]]; then
+            # Use WARC files starting from index 0
+            local warc_file=$(printf "${WARC_DIR}/CC-MAIN-20230320083513-20230320113513-%05d.warc.wet" $worker_index)
+            log_output "[$run_label] Launching worker ${worker_id} on ${worker} (WARC file: index $worker_index)..."
+            ssh "$worker" \
+                "nohup python3 ~/client.py ${worker_id} ${WORKERS} --master-host ${MASTER} --control-port ${CONTROL_PORT} --shuffle-port-base ${SHUFFLE_BASE} --split-id \"${warc_file}\" > ~/mapreduce_worker_${worker_id}.log 2>&1 &" &
+        else
+            # Use split_X.txt files (default mode)
+            log_output "[$run_label] Launching worker ${worker_id} on ${worker} (split_${worker_id}.txt)..."
+            ssh "$worker" \
+                "nohup python3 ~/client.py ${worker_id} ${WORKERS} --master-host ${MASTER} --control-port ${CONTROL_PORT} --shuffle-port-base ${SHUFFLE_BASE} > ~/mapreduce_worker_${worker_id}.log 2>&1 &" &
+        fi
         ((worker_id++))
+        ((worker_index++))
     done
     
     wait  # Wait for all SSH commands to complete
@@ -320,11 +360,11 @@ show_results() {
         log_output "Top 10 words:"
         while IFS= read -r line; do
             log_output "  $line"
-        done < <(awk '/Final wordcount:/{flag=1; next} flag && /^[a-z]/ {print $0} flag && !/^[a-z]/{exit}' "$log_file" | head -10)
+        done < <(awk '/Final wordcount:/{flag=1; next} flag && /^[^ ]+: [0-9]+$/ {print $0} flag && !/^[^ ]+: [0-9]+$/ && NF>0 {exit}' "$log_file" | head -10)
         
         # Count total unique words and occurrences
-        local unique_words=$(awk '/Final wordcount:/{flag=1; next} flag && /^[a-z]+: [0-9]+$/ {count++} flag && !/^[a-z]/{exit} END{print count}' "$log_file")
-        local total_occurrences=$(awk '/Final wordcount:/{flag=1; next} flag && /^[a-z]+: [0-9]+$/ {total+=$2} flag && !/^[a-z]/{exit} END{print total}' "$log_file")
+        local unique_words=$(awk '/Final wordcount:/{flag=1; next} flag && /^[^ ]+: [0-9]+$/ {count++} END{print count}' "$log_file")
+        local total_occurrences=$(awk '/Final wordcount:/{flag=1; next} flag && /^[^ ]+: [0-9]+$/ {total+=$2} END{print total}' "$log_file")
         log_output ""
         log_output "Total unique words: $unique_words"
         log_output "Total occurrences: $total_occurrences"
