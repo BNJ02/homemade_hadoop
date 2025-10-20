@@ -59,9 +59,22 @@ Cette commande exécute 4 campagnes (1, 3, 5 et 10 machines) avec 10 splits WARC
 
 ---
 
-## 4. Exemples complets
+## 4. Contrôle automatique des hôtes
 
-### 4.1 30 splits, 7 campagnes, 3 répétitions
+Avant chaque campagne, `benchmark_warc.py` vérifie la disponibilité du master et des workers listés :
+
+- un `ping` (1,5 s de délai par hôte) est envoyé à chaque machine
+- les hôtes qui ne répondent pas sont automatiquement retirés du `host-pool` et signalés dans la console
+- le script continue tant qu’il reste suffisamment de machines pour couvrir les `machine_count` demandés **sinon** il échoue explicitement
+- si l’outil `ping` est absent, aucun filtrage n’est effectué (les hôtes sont alors utilisés “tels quels”)
+
+⚠️ Pensez à ajuster votre `--host-pool` si le filtrage retire des machines essentielles, ou à vérifier la connectivité réseau avant de lancer une campagne longue.
+
+---
+
+## 5. Exemples complets
+
+### 5.1 30 splits, 7 campagnes, 3 répétitions
 
 ```bash
 python benchmark_warc.py \
@@ -74,7 +87,7 @@ python benchmark_warc.py \
   --results-csv warc_speedup_DATE
 ```
 
-### 4.2 Balayer plusieurs tailles de splits
+### 5.2 Balayer plusieurs tailles de splits
 
 ```bash
 python benchmark_warc.py \
@@ -94,7 +107,7 @@ python benchmark_warc.py \
 >- 5:5000 ⇒ pour 5 machines, un essai à 5 000 lignes max.
 >- 10:20000 ⇒ pour 10 machines, un essai à 20 000 lignes max.
 
-### 4.3 Limites communes à toutes les configurations
+### 5.3 Limites communes à toutes les configurations
 
 ```bash
 python benchmark_warc.py \
@@ -109,7 +122,7 @@ python benchmark_warc.py \
 
 Tous les `machine_count` sont testés avec 5 000 puis 20 000 lignes (utile pour dégager une 3ᵉ dimension uniforme).
 
-### 4.4 Simulation (dry-run)
+### 5.4 Simulation (dry-run)
 
 ```bash
 python benchmark_warc.py \
@@ -123,7 +136,7 @@ python benchmark_warc.py \
 
 ---
 
-## 5. Structure du CSV de sortie
+## 6. Structure du CSV de sortie
 
 Chaque ligne correspond à une campagne (n machines) et comporte :
 
@@ -140,7 +153,7 @@ Les fichiers sont appendés : plusieurs campagnes peuvent cohabiter dans le mêm
 
 ---
 
-## 6. Exploitation dans `amdahl_analysis.ipynb`
+## 7. Exploitation dans `amdahl_analysis.ipynb`
 
 1. **Définir le fichier CSV** : dans la première cellule, mettre à jour `CSV_PATH` (ex. `Path('warc_speedup_DATE.csv')`).
 2. **Exécuter toutes les cellules** (`Run All`). Les étapes :
@@ -153,7 +166,7 @@ Les fichiers sont appendés : plusieurs campagnes peuvent cohabiter dans le mêm
 
 ---
 
-## 7. Conseils / bonnes pratiques
+## 8. Conseils / bonnes pratiques
 
 - **Toujours synchroniser** (`--skip-sync` absent) après modification de `client.py`/`serveur.py`.
 - **Surveiller les logs** : `~/mapreduce_master.log` et `~/mapreduce_worker_X.log` pour diagnostiquer un `status=failed`.
