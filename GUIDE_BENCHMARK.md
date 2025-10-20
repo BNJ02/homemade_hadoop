@@ -1,0 +1,120 @@
+# Guide d'utilisation `benchmark_warc.py` & `amdahl_analysis.ipynb`
+
+Ce document explique comment exécuter des campagnes d'expériences avec `benchmark_warc.py` et comment analyser les résultats dans le notebook `amdahl_analysis.ipynb` pour illustrer la loi d'Amdahl.
+
+---
+
+## 1. Pré-requis
+
+- Accès SSH aux machines du cluster (clé déjà installée pour l'utilisateur, ici `blepourt-25`).
+- `client.py` et `serveur.py` présents à la racine du projet (le script les synchronise automatiquement).
+- Python 3.x et les dépendances standards (`pandas`, `numpy`, `matplotlib`, `nbformat` si besoin pour le notebook).
+- Un fichier CSV généré par `benchmark_warc.py` (non nécessaire pour l'exécution, uniquement pour le notebook).
+
+---
+
+## 2. Commande de base
+
+```bash
+python benchmark_warc.py \
+  --ssh-user blepourt-25 \
+  --machine-counts 1,3,5,10 \
+  --map-max-lines 50000 \
+  --timeout 600 \
+  --results-csv warc_speedup
+```
+
+Cette commande exécute 4 campagnes (1, 3, 5 et 10 machines) avec 10 splits WARC par défaut, limite chaque worker à 50 000 lignes, et dépose les résultats dans `warc_speedup_DATE.csv`.
+
+---
+
+## 3. Options disponibles
+
+| Option | Description | Défaut |
+|--------|-------------|--------|
+| `--master HOST` | Machine master (`serveur.py`). | `tp-4b01-10` |
+| `--host-pool HOSTS` | Liste des workers séparés par des virgules. | `tp-4b01-11` … `tp-4b01-20` |
+| `--machine-counts N1,N2,...` | Nombre de machines à activer par campagne. | `1,3,5,10` |
+| `--total-workers N` | Nombre total de workers/splits. Idéal pour 30 splits : `--total-workers 30`. | `10` |
+| `--warc-dir DIR` & `--warc-template PATTERN` | Répertoire & motif des WARC. | `/cal/commoncrawl` & `CC-MAIN-20230320083513-20230320113513-{index:05d}.warc.wet` |
+| `--warc-offset K` | Décalage d’index (0 ⇒ `00000`, 1 ⇒ `00001`, etc.). | `0` |
+| `--map-max-lines L` | Nombre maximum de lignes lues par worker pendant la phase map (`client.py`). Permet de dimensionner la charge. | `None` |
+| `--control-port`, `--shuffle-port-base` | Ports utilisés par master/clients. | `5374`, `6200` |
+| `--remote-python BIN` | Interpréteur python sur les machines distantes. | `python3` |
+| `--remote-root PATH` | Répertoire où copier/chercher `serveur.py` & `client.py`. | `~` |
+| `--ssh-user USER` | Nom d’utilisateur SSH. | `$SSH_USER` ou `$USER` |
+| `--ssh-key PATH` | Clé privée pour SSH. | S/O |
+| `--ssh-args "args"` | Options supplémentaires SSH (s’ajoutent à `-o BatchMode=yes …`). | S/O |
+| `--skip-sync` | Ne pas synchroniser `client.py`/`serveur.py` avant la campagne. | `False` |
+| `--dry-run` | Affiche les commandes sans les exécuter. | `False` |
+| `--verbose` | Log détaillé des commandes SSH/SCP. | `False` |
+| `--sleep-after-master S` | Pause après lancement du master (s). | `2.0` |
+| `--timeout T` | Temps max par campagne (s). | `900` |
+| `--results-csv FILE` | Fichier CSV append pour consigner les mesures. | `None` |
+
+---
+
+## 4. Exemples complets
+
+### 4.1 30 splits avec 7 campagnes
+
+```bash
+python benchmark_warc.py \
+  --ssh-user blepourt-25 \
+  --total-workers 30 \
+  --machine-counts 1,3,5,10,15,20,30 \
+  --map-max-lines 1000000 \
+  --timeout 900 \
+  --results-csv warc_speedup_DATE
+```
+
+### 4.2 Simulation (dry-run)
+
+```bash
+python benchmark_warc.py \
+  --ssh-user blepourt-25 \
+  --total-workers 5 \
+  --machine-counts 1 \
+  --dry-run --verbose
+```
+
+> Affiche l’intégralité des commandes sans lancer le cluster.
+
+---
+
+## 5. Structure du CSV de sortie
+
+Chaque ligne correspond à une campagne (n machines) et comporte :
+
+- `machine_count` : nombre de machines distinctes utilisées.
+- `elapsed_seconds` : durée totale.
+- `speedup` : ratio temps_1_machine / temps_N (si calculé).
+- `serial_fraction` : estimation `f` à partir de la loi d’Amdahl (pour N > 1).
+- `status` : `ok` ou `failed`.
+- `notes` : commentaire (inclut par défaut la prédiction d’Amdahl).
+
+Les fichiers sont appendés : plusieurs campagnes peuvent cohabiter dans le même CSV.
+
+---
+
+## 6. Exploitation dans `amdahl_analysis.ipynb`
+
+1. **Définir le fichier CSV** : dans la première cellule, mettre à jour `CSV_PATH` (ex. `Path('warc_speedup_DATE.csv')`).
+2. **Exécuter toutes les cellules** (`Run All`). Les étapes :
+   - Chargement des data (`pd.read_csv` + nettoyage de la colonne `notes`).
+   - Filtrage des campagnes réussies (`status == "ok"`).
+   - Calcul du speedup observé et régression sur la fraction sérielle `f`.
+   - Graphiques : speedup observé vs prédiction d’Amdahl + temps total.
+   - Interprétation (markdown) rappelant pourquoi les gains plafonnent.
+3. **Exporter si besoin** : `File > Download > HTML` pour partager la figure et l’analyse.
+
+---
+
+## 7. Conseils / bonnes pratiques
+
+- **Toujours synchroniser** (`--skip-sync` absent) après modification de `client.py`/`serveur.py`.
+- **Surveiller les logs** : `~/mapreduce_master.log` et `~/mapreduce_worker_X.log` pour diagnostiquer un `status=failed`.
+- **Ajuster la charge** : `--total-workers`, `--map-max-lines` ou `--warc-offset` permettent d’obtenir des jobs plus longs et significatifs pour l’étude d’Amdahl.
+- **Multipliez les campagnes** pour lisser les variations réseau : relancez la commande plusieurs fois et consolidez les CSV.
+
+Bon benchmark !

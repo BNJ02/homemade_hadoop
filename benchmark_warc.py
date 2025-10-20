@@ -16,6 +16,7 @@ Usage example (defaults mirror run_cluster.sh):
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import posixpath
 import random
@@ -614,8 +615,9 @@ def main(argv: Sequence[str]) -> int:
         return 130
     format_results(results)
     if args.results_csv:
-        write_csv(results, args.results_csv)
-        print(f"\nResults appended to {args.results_csv}")
+        args_results_csv = args.results_csv + datetime.now().strftime("_%Y%m%d_%H%M%S") + ".csv"
+        write_csv(results, args_results_csv)
+        print(f"\nResults appended to {args_results_csv}")
     failures = [res for res in results if res.status != "ok"]
     return 1 if failures else 0
 
