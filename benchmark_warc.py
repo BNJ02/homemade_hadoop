@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import posixpath
+import random
 import shlex
 import subprocess
 import sys
@@ -27,6 +28,16 @@ from typing import Iterable, List, Sequence
 
 
 DEFAULT_HOST_POOL = [
+    "tp-4b01-01",
+    "tp-4b01-02",
+    "tp-4b01-03",
+    "tp-4b01-04",
+    "tp-4b01-05",
+    "tp-4b01-06",
+    "tp-4b01-07",
+    # "tp-4b01-08",
+    "tp-4b01-09",
+    "tp-4b01-10",
     "tp-4b01-11",
     "tp-4b01-12",
     "tp-4b01-13",
@@ -37,6 +48,30 @@ DEFAULT_HOST_POOL = [
     "tp-4b01-18",
     "tp-4b01-19",
     "tp-4b01-20",
+    "tp-4b01-21",
+    "tp-4b01-22",
+    "tp-4b01-23",
+    "tp-4b01-24",
+    "tp-4b01-25",
+    "tp-4b01-26",
+    "tp-4b01-27",
+    # "tp-4b01-28",
+    "tp-4b01-29",
+    "tp-4b01-30",
+    "tp-4b01-31",
+    "tp-4b01-32",
+    "tp-4b01-33",
+    "tp-4b01-34",
+    "tp-4b01-35",
+    "tp-4b01-36",
+    "tp-4b01-37",
+    "tp-4b01-38",
+    "tp-4b01-39",
+    "tp-4b01-40",
+    "tp-4b01-41",
+    "tp-4b01-42",
+    # "tp-4b01-43",
+    "tp-4b01-44"
 ]
 
 DEFAULT_SSH_OPTIONS = [
@@ -312,15 +347,17 @@ def sync_remote_code(
     if not remote_dir.endswith("/"):
         remote_dir = f"{remote_dir}/"
     files_to_copy = ["serveur.py", "client.py"]
-    for host in unique_hosts:
-        target = host if user is None or "@" in host else f"{user}@{host}"
-        for local_path in files_to_copy:
-            scp_cmd = ["scp", *ssh_options, local_path, f"{target}:{remote_dir}"]
-            if dry_run or verbose:
-                print(f"[scp] {' '.join(shlex.quote(part) for part in scp_cmd)}")
-            if dry_run:
-                continue
-            subprocess.run(scp_cmd, check=True)
+    # All hosts are expected to have the same remote_root structure (NFS : Network File System)
+    # Take a random host to display the scp command, real random selection is needed
+    host = random.choice(unique_hosts)
+    target = host if user is None or "@" in host else f"{user}@{host}"
+    for local_path in files_to_copy:
+        scp_cmd = ["scp", *ssh_options, local_path, f"{target}:{remote_dir}"]
+        if dry_run or verbose:
+            print(f"[scp] {' '.join(shlex.quote(part) for part in scp_cmd)}")
+        if dry_run:
+            continue
+        subprocess.run(scp_cmd, check=True)
 
 
 def kill_remote_processes(runner: SSHRunner, hosts: Iterable[str]) -> None:
