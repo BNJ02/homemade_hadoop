@@ -40,6 +40,7 @@ Cette commande exécute 4 campagnes (1, 3, 5 et 10 machines) avec 10 splits WARC
 | `--warc-offset K` | Décalage d’index (0 ⇒ `00000`, 1 ⇒ `00001`, etc.). | `0` |
 | `--map-max-lines L` | Nombre maximum de lignes lues par worker pendant la phase map (`client.py`). Permet de dimensionner la charge. | `None` |
 | `--map-lines-lists SPEC` | Quand `--map-max-lines` est omis, permet de définir des listes de lignes par `machine_count` (ex. `1:10000,20000;10:50000`). | `None` |
+| `--map-lines-all LIST` | Limites communes appliquées à tous les `machine_count` si `--map-max-lines` est omis et qu’il n’existe pas d’entrée dans `--map-lines-lists`. | `None` |
 | `--runs-per-count R` | Répéter chaque configuration (machine count) `R` fois pour moyenner les résultats. | `1` |
 | `--control-port`, `--shuffle-port-base` | Ports utilisés par master/clients. | `5374`, `6200` |
 | `--remote-python BIN` | Interpréteur python sur les machines distantes. | `python3` |
@@ -54,11 +55,13 @@ Cette commande exécute 4 campagnes (1, 3, 5 et 10 machines) avec 10 splits WARC
 | `--timeout T` | Temps max par campagne (s). | `900` |
 | `--results-csv FILE` | Fichier CSV append pour consigner les mesures. | `None` |
 
+> Priorité des limites de lignes : `--map-max-lines` > `--map-lines-lists` > `--map-lines-all`.
+
 ---
 
 ## 4. Exemples complets
 
-### 4.1 30 splits avec 7 campagnes (3 répétitions)
+### 4.1 30 splits, 7 campagnes, 3 répétitions
 
 ```bash
 python benchmark_warc.py \
@@ -91,7 +94,22 @@ python benchmark_warc.py \
 >- 5:5000 ⇒ pour 5 machines, un essai à 5 000 lignes max.
 >- 10:20000 ⇒ pour 10 machines, un essai à 20 000 lignes max.
 
-### 4.2 Simulation (dry-run)
+### 4.3 Limites communes à toutes les configurations
+
+```bash
+python benchmark_warc.py \
+  --ssh-user blepourt-25 \
+  --total-workers 10 \
+  --machine-counts 1,3,5,10 \
+  --map-lines-all 5000,20000 \
+  --runs-per-count 2 \
+  --timeout 900 \
+  --results-csv warc_speedup_all
+```
+
+Tous les `machine_count` sont testés avec 5 000 puis 20 000 lignes (utile pour dégager une 3ᵉ dimension uniforme).
+
+### 4.4 Simulation (dry-run)
 
 ```bash
 python benchmark_warc.py \
@@ -141,5 +159,6 @@ Les fichiers sont appendés : plusieurs campagnes peuvent cohabiter dans le mêm
 - **Surveiller les logs** : `~/mapreduce_master.log` et `~/mapreduce_worker_X.log` pour diagnostiquer un `status=failed`.
 - **Ajuster la charge** : `--total-workers`, `--map-max-lines` ou `--warc-offset` permettent d’obtenir des jobs plus longs et significatifs pour l’étude d’Amdahl.
 - **Multipliez les campagnes** pour lisser les variations réseau : relancez la commande plusieurs fois et consolidez les CSV.
+- **Nettoyage** : en cas d’arrêt manuel, exécuter `pkill -f "python3.*serveur.py"` sur le master et `pkill -f "python3.*client.py"` sur les workers.
 
 Bon benchmark !

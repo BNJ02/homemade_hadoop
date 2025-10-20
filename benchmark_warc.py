@@ -207,6 +207,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--map-lines-all",
+        help=(
+            "Optional comma-separated limits applied to every machine count "
+            "when --map-max-lines is not set (overridden by --map-lines-lists)"
+        ),
+    )
+    parser.add_argument(
         "--runs-per-count",
         type=int,
         default=1,
@@ -250,6 +257,26 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def parse_csv_list(raw: str) -> List[str]:
     items = [part.strip() for part in raw.split(",")]
     return [item for item in items if item]
+
+
+def parse_line_limits_list(raw: str | None) -> List[int]:
+    if not raw:
+        return []
+    values: List[int] = []
+    for value in raw.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid line limit '{value}' in --map-lines-all") from exc
+        if parsed <= 0:
+            raise ValueError("--map-lines-all values must be > 0")
+        values.append(parsed)
+    if not values:
+        raise ValueError("No valid values supplied to --map-lines-all")
+    return values
 
 
 def parse_map_lines_config(raw: str | None) -> dict[int, List[int]]:
@@ -527,6 +554,10 @@ def launch_benchmark(args: argparse.Namespace) -> List[RunResult]:
         map_lines_mapping = parse_map_lines_config(args.map_lines_lists)
     except ValueError as exc:
         raise ValueError(f"Invalid --map-lines-lists configuration: {exc}") from exc
+    try:
+        map_lines_all = parse_line_limits_list(args.map_lines_all)
+    except ValueError as exc:
+        raise ValueError(f"Invalid --map-lines-all configuration: {exc}") from exc
     host_pool = parse_csv_list(args.host_pool)
     machine_counts = [int(value) for value in parse_csv_list(args.machine_counts)]
     warc_paths = generate_warc_paths(
@@ -575,7 +606,12 @@ def launch_benchmark(args: argparse.Namespace) -> List[RunResult]:
         if args.map_max_lines is not None:
             line_limits = [args.map_max_lines]
         else:
-            line_limits = map_lines_mapping.get(count, [None])
+            if count in map_lines_mapping:
+                line_limits = list(map_lines_mapping[count])
+            elif map_lines_all:
+                line_limits = list(map_lines_all)
+            else:
+                line_limits = [None]
 
         for line_limit in line_limits:
             for iteration in range(args.runs_per_count):
