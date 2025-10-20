@@ -158,6 +158,7 @@ Les fichiers sont appendés : plusieurs campagnes peuvent cohabiter dans le mêm
 - **Toujours synchroniser** (`--skip-sync` absent) après modification de `client.py`/`serveur.py`.
 - **Surveiller les logs** : `~/mapreduce_master.log` et `~/mapreduce_worker_X.log` pour diagnostiquer un `status=failed`.
 - **Ajuster la charge** : `--total-workers`, `--map-max-lines` ou `--warc-offset` permettent d’obtenir des jobs plus longs et significatifs pour l’étude d’Amdahl.
+- **Contrôle des hôtes** : les machines injoignables (ping KO) sont automatiquement retirées du host-pool. Vérifiez que la liste restante couvre vos machine_count.
 - **Multipliez les campagnes** pour lisser les variations réseau : relancez la commande plusieurs fois et consolidez les CSV.
 - **Nettoyage** : en cas d’arrêt manuel, exécuter `pkill -f "python3.*serveur.py"` sur le master et `pkill -f "python3.*client.py"` sur les workers.
 

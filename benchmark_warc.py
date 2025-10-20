@@ -18,62 +18,23 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import platform
 import posixpath
 import random
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+import json
 from dataclasses import dataclass, field
 from typing import Iterable, List, Sequence
 
-
-DEFAULT_HOST_POOL = [
-    "tp-4b01-01",
-    "tp-4b01-02",
-    "tp-4b01-03",
-    "tp-4b01-04",
-    "tp-4b01-05",
-    "tp-4b01-06",
-    "tp-4b01-07",
-    # "tp-4b01-08",
-    "tp-4b01-09",
-    "tp-4b01-10",
-    "tp-4b01-11",
-    "tp-4b01-12",
-    "tp-4b01-13",
-    "tp-4b01-14",
-    "tp-4b01-15",
-    "tp-4b01-16",
-    "tp-4b01-17",
-    "tp-4b01-18",
-    "tp-4b01-19",
-    "tp-4b01-20",
-    "tp-4b01-21",
-    "tp-4b01-22",
-    "tp-4b01-23",
-    "tp-4b01-24",
-    "tp-4b01-25",
-    "tp-4b01-26",
-    "tp-4b01-27",
-    # "tp-4b01-28",
-    "tp-4b01-29",
-    "tp-4b01-30",
-    "tp-4b01-31",
-    "tp-4b01-32",
-    "tp-4b01-33",
-    "tp-4b01-34",
-    "tp-4b01-35",
-    "tp-4b01-36",
-    "tp-4b01-37",
-    "tp-4b01-38",
-    "tp-4b01-39",
-    "tp-4b01-40",
-    "tp-4b01-41",
-    "tp-4b01-42",
-    # "tp-4b01-43",
-    "tp-4b01-44"
-]
+# Load default host pool from JSON file
+hosts = []
+with open('hosts.json', 'r') as f:
+    hosts = json.load(f)
+DEFAULT_HOST_POOL = hosts
 
 DEFAULT_SSH_OPTIONS = [
     "-o",
@@ -320,6 +281,42 @@ def parse_map_lines_config(raw: str | None) -> dict[int, List[int]]:
     return mapping
 
 
+def is_host_reachable(host: str, timeout: float = 1.5) -> bool:
+    if not host:
+        return False
+    if shutil.which("ping") is None:
+        return True
+    system = platform.system().lower()
+    if system == "windows":
+        command = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), host]
+    else:
+        command = ["ping", "-c", "1", "-W", str(int(timeout)), host]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 1.0,
+            check=False,
+        )
+        return completed.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def filter_reachable_hosts(hosts: Sequence[str]) -> tuple[List[str], List[str]]:
+    if shutil.which("ping") is None:
+        return list(hosts), []
+    reachable: List[str] = []
+    unreachable: List[str] = []
+    for host in hosts:
+        if is_host_reachable(host):
+            reachable.append(host)
+        else:
+            unreachable.append(host)
+    return reachable, unreachable
+
+
 def generate_warc_paths(
     total: int,
     warc_dir: str,
@@ -559,6 +556,23 @@ def launch_benchmark(args: argparse.Namespace) -> List[RunResult]:
     except ValueError as exc:
         raise ValueError(f"Invalid --map-lines-all configuration: {exc}") from exc
     host_pool = parse_csv_list(args.host_pool)
+    reachable_hosts, unreachable_hosts = filter_reachable_hosts(host_pool)
+    if unreachable_hosts:
+        print(
+            "[host-check] Removing unreachable hosts: "
+            + ", ".join(unreachable_hosts),
+            file=sys.stderr,
+        )
+    if not reachable_hosts:
+        raise RuntimeError(
+            "No reachable workers detected in host pool after filtering."
+        )
+    host_pool = reachable_hosts
+    if not is_host_reachable(args.master):
+        print(
+            f"[host-check] Warning: master host {args.master} did not respond to ping.",
+            file=sys.stderr,
+        )
     machine_counts = [int(value) for value in parse_csv_list(args.machine_counts)]
     warc_paths = generate_warc_paths(
         args.total_workers,
