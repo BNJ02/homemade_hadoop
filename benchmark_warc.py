@@ -89,6 +89,8 @@ DEFAULT_SSH_OPTIONS = [
 class RunResult:
     machine_count: int
     worker_layout: List[str]
+    run_iteration: int = 1
+    map_max_lines: int | None = None
     elapsed_seconds: float | None = None
     speedup: float | None = None
     serial_fraction: float | None = None
@@ -198,6 +200,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Optional limit of input lines per worker during the map stage",
     )
     parser.add_argument(
+        "--map-lines-lists",
+        help=(
+            "Optional list describing max lines per machine count (format "
+            "\"N1:V1,V2;N2:V3\"), used when --map-max-lines is not set"
+        ),
+    )
+    parser.add_argument(
+        "--runs-per-count",
+        type=int,
+        default=1,
+        help="Number of repetitions to execute for each machine count (default: 1)",
+    )
+    parser.add_argument(
         "--skip-sync",
         action="store_true",
         help="Do not copy client.py/serveur.py to remote hosts before launching runs",
@@ -235,6 +250,47 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def parse_csv_list(raw: str) -> List[str]:
     items = [part.strip() for part in raw.split(",")]
     return [item for item in items if item]
+
+
+def parse_map_lines_config(raw: str | None) -> dict[int, List[int]]:
+    if not raw:
+        return {}
+    mapping: dict[int, List[int]] = {}
+    entries = [entry.strip() for entry in raw.split(";") if entry.strip()]
+    if not entries:
+        raise ValueError("Invalid --map-lines-lists format (empty entries)")
+    for entry in entries:
+        if ":" not in entry:
+            raise ValueError(
+                f"Invalid --map-lines-lists fragment '{entry}' (expected COUNT:V1,V2)"
+            )
+        count_part, values_part = entry.split(":", 1)
+        try:
+            count = int(count_part.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid machine count '{count_part}' in --map-lines-lists"
+            ) from exc
+        if count < 1:
+            raise ValueError("--map-lines-lists machine counts must be >= 1")
+        values_raw = [v.strip() for v in values_part.split(",") if v.strip()]
+        if not values_raw:
+            raise ValueError(
+                f"No values provided for machine count {count} in --map-lines-lists"
+            )
+        values: List[int] = []
+        for value in values_raw:
+            try:
+                parsed = int(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid line limit '{value}' for machine count {count}"
+                ) from exc
+            if parsed <= 0:
+                raise ValueError("--map-lines-lists values must be > 0")
+            values.append(parsed)
+        mapping[count] = values
+    return mapping
 
 
 def generate_warc_paths(
@@ -398,38 +454,52 @@ def wait_for_completion(
 
 
 def compute_speedups(results: List[RunResult]) -> None:
-    baseline = None
+    grouped: dict[int | None, List[RunResult]] = {}
     for result in results:
-        if result.status == "ok":
-            baseline = result.elapsed_seconds
-            break
-    if baseline is None or not baseline:
-        return
-    serial_estimates: List[float] = []
-    for result in results:
-        if result.status != "ok" or not result.elapsed_seconds:
+        grouped.setdefault(result.map_max_lines, []).append(result)
+
+    for map_lines, group in grouped.items():
+        ok_results = [
+            res for res in group if res.status == "ok" and res.elapsed_seconds
+        ]
+        if not ok_results:
             continue
-        result.speedup = baseline / result.elapsed_seconds
-        if result.machine_count > 1:
-            ratio = result.elapsed_seconds / baseline
-            n = result.machine_count
-            numerator = ratio - (1.0 / n)
-            denominator = 1.0 - (1.0 / n)
-            if denominator > 0:
-                serial = max(0.0, min(1.0, numerator / denominator))
-                result.serial_fraction = serial
-                serial_estimates.append(serial)
-    if serial_estimates:
-        avg_serial = sum(serial_estimates) / len(serial_estimates)
-        for result in results:
-            if result.status == "ok":
-                predicted = 1.0 / (avg_serial + (1.0 - avg_serial) / result.machine_count)
-                note = f"Predicted speedup (Amdahl, f={avg_serial:.3f}): {predicted:.3f}"
+        baseline_result = min(
+            ok_results, key=lambda res: (res.machine_count, res.elapsed_seconds)
+        )
+        baseline = baseline_result.elapsed_seconds
+        if not baseline:
+            continue
+        serial_estimates: List[float] = []
+        for result in ok_results:
+            result.speedup = baseline / result.elapsed_seconds
+            if result.machine_count > 1:
+                ratio = result.elapsed_seconds / baseline
+                n = result.machine_count
+                numerator = ratio - (1.0 / n)
+                denominator = 1.0 - (1.0 / n)
+                if denominator > 0:
+                    serial = max(0.0, min(1.0, numerator / denominator))
+                    result.serial_fraction = serial
+                    serial_estimates.append(serial)
+        if serial_estimates:
+            avg_serial = sum(serial_estimates) / len(serial_estimates)
+            for result in ok_results:
+                predicted = 1.0 / (
+                    avg_serial + (1.0 - avg_serial) / result.machine_count
+                )
+                note = (
+                    f"Predicted speedup (Amdahl, f={avg_serial:.3f}): "
+                    f"{predicted:.3f}"
+                )
                 result.notes.append(note)
 
 
 def write_csv(results: List[RunResult], path: str) -> None:
-    header = "machine_count,elapsed_seconds,speedup,serial_fraction,status,notes\n"
+    header = (
+        "machine_count,run_iteration,map_max_lines,"
+        "elapsed_seconds,speedup,serial_fraction,status,notes\n"
+    )
     line_parts = []
     file_exists = os.path.exists(path)
     with open(path, "a", encoding="ascii") as handle:
@@ -439,6 +509,8 @@ def write_csv(results: List[RunResult], path: str) -> None:
             notes = "|".join(result.notes)
             line_parts = [
                 str(result.machine_count),
+                str(result.run_iteration),
+                str(result.map_max_lines) if result.map_max_lines is not None else "",
                 f"{result.elapsed_seconds:.3f}" if result.elapsed_seconds else "",
                 f"{result.speedup:.3f}" if result.speedup else "",
                 f"{result.serial_fraction:.3f}" if result.serial_fraction else "",
@@ -449,6 +521,12 @@ def write_csv(results: List[RunResult], path: str) -> None:
 
 
 def launch_benchmark(args: argparse.Namespace) -> List[RunResult]:
+    if args.runs_per_count < 1:
+        raise ValueError("--runs-per-count must be greater than or equal to 1")
+    try:
+        map_lines_mapping = parse_map_lines_config(args.map_lines_lists)
+    except ValueError as exc:
+        raise ValueError(f"Invalid --map-lines-lists configuration: {exc}") from exc
     host_pool = parse_csv_list(args.host_pool)
     machine_counts = [int(value) for value in parse_csv_list(args.machine_counts)]
     warc_paths = generate_warc_paths(
@@ -486,104 +564,129 @@ def launch_benchmark(args: argparse.Namespace) -> List[RunResult]:
 
     results: List[RunResult] = []
     for count in machine_counts:
-        result = RunResult(machine_count=count, worker_layout=[])
-        results.append(result)
         try:
             layout = build_worker_layout(host_pool, count, args.total_workers)
-            result.worker_layout = layout
         except ValueError as exc:
-            result.record_failure(str(exc))
+            result = RunResult(machine_count=count, worker_layout=[], status="failed")
+            result.notes.append(str(exc))
+            results.append(result)
             continue
 
-        print(f"\n=== Run with {count} machine(s) for {args.total_workers} WARC splits ===")
-        print(f"Master: {args.master}")
-        print(f"Worker layout: {layout}")
-        print(f"WARC files: {warc_paths}")
-
-        kill_hosts = set(layout)
-        kill_hosts.add(args.master)
-        kill_remote_processes(runner, kill_hosts)
-
-        master_cmd = build_remote_launcher(
-            args.remote_python,
-            args.remote_root,
-            "serveur.py",
-            [
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(args.control_port),
-                "--num-workers",
-                str(args.total_workers),
-            ],
-            "mapreduce_master.log",
-        )
-        try:
-            runner.run(args.master, master_cmd)
-        except subprocess.CalledProcessError as exc:
-            result.record_failure(f"Failed to start master: {exc}")
-            continue
-
-        if args.sleep_after_master:
-            time.sleep(args.sleep_after_master)
-
-        host_args = layout
-        worker_failures = False
-        for index, host in enumerate(layout, start=1):
-            extra = [
-                str(index),
-                *host_args,
-                "--master-host",
-                args.master,
-                "--control-port",
-                str(args.control_port),
-                "--shuffle-port-base",
-                str(args.shuffle_port_base),
-                "--split-id",
-                warc_paths[index - 1],
-            ]
-            if args.map_max_lines:
-                extra.extend(["--max-lines", str(args.map_max_lines)])
-            worker_cmd = build_remote_launcher(
-                args.remote_python,
-                args.remote_root,
-                "client.py",
-                extra,
-                f"mapreduce_worker_{index}.log",
-            )
-            try:
-                runner.run(host, worker_cmd)
-            except subprocess.CalledProcessError as exc:
-                worker_failures = True
-                result.notes.append(f"Worker {index} launch failed on {host}: {exc}")
-
-        if worker_failures:
-            result.record_failure("One or more workers failed to launch")
-            continue
-
-        start = time.monotonic()
-        if runner.dry_run:
-            result.status = "skipped"
-            result.notes.append("Dry-run mode: commands printed but not executed")
-            print("Dry-run: skipping remote execution and timing for this configuration.")
-            continue
-
-        completed = wait_for_completion(
-            runner,
-            args.master,
-            layout,
-            args.timeout,
-            args.remote_root,
-        )
-        elapsed = time.monotonic() - start
-
-        if completed:
-            result.record_success(elapsed)
-            print(f"Run completed in {elapsed:.2f}s")
+        if args.map_max_lines is not None:
+            line_limits = [args.map_max_lines]
         else:
-            result.record_failure(f"Timeout after {elapsed:.2f}s (limit {args.timeout}s)")
+            line_limits = map_lines_mapping.get(count, [None])
 
-        kill_remote_processes(runner, kill_hosts)
+        for line_limit in line_limits:
+            for iteration in range(args.runs_per_count):
+                result = RunResult(
+                    machine_count=count,
+                    worker_layout=list(layout),
+                    run_iteration=iteration + 1,
+                    map_max_lines=line_limit,
+                )
+                results.append(result)
+
+                iteration_suffix = ""
+                if args.runs_per_count > 1:
+                    iteration_suffix = f" (run {iteration + 1}/{args.runs_per_count})"
+                max_lines_label = (
+                    str(line_limit) if line_limit is not None else "None"
+                )
+
+                print(
+                    f"\n=== Run with {count} machine(s){iteration_suffix} for "
+                    f"{args.total_workers} WARC splits ==="
+                )
+                print(f"Master: {args.master}")
+                print(f"Worker layout: {layout}")
+                print(f"WARC files: {warc_paths}")
+                print(f"Map max lines: {max_lines_label}")
+
+                kill_hosts = set(layout)
+                kill_hosts.add(args.master)
+                kill_remote_processes(runner, kill_hosts)
+
+                master_cmd = build_remote_launcher(
+                    args.remote_python,
+                    args.remote_root,
+                    "serveur.py",
+                    [
+                        "--host",
+                        "0.0.0.0",
+                        "--port",
+                        str(args.control_port),
+                        "--num-workers",
+                        str(args.total_workers),
+                    ],
+                    "mapreduce_master.log",
+                )
+                try:
+                    runner.run(args.master, master_cmd)
+                except subprocess.CalledProcessError as exc:
+                    result.record_failure(f"Failed to start master: {exc}")
+                    continue
+
+                if args.sleep_after_master:
+                    time.sleep(args.sleep_after_master)
+
+                host_args = layout
+                worker_failures = False
+                for index, host in enumerate(layout, start=1):
+                    extra = [
+                        str(index),
+                        *host_args,
+                        "--master-host",
+                        args.master,
+                        "--control-port",
+                        str(args.control_port),
+                        "--shuffle-port-base",
+                        str(args.shuffle_port_base),
+                        "--split-id",
+                        warc_paths[index - 1],
+                    ]
+                    if line_limit is not None:
+                        extra.extend(["--max-lines", str(line_limit)])
+                    worker_cmd = build_remote_launcher(
+                        args.remote_python,
+                        args.remote_root,
+                        "client.py",
+                        extra,
+                        f"mapreduce_worker_{index}.log",
+                    )
+                    try:
+                        runner.run(host, worker_cmd)
+                    except subprocess.CalledProcessError as exc:
+                        worker_failures = True
+                        result.notes.append(f"Worker {index} launch failed on {host}: {exc}")
+
+                if worker_failures:
+                    result.record_failure("One or more workers failed to launch")
+                    continue
+
+                start = time.monotonic()
+                if runner.dry_run:
+                    result.status = "skipped"
+                    result.notes.append("Dry-run mode: commands printed but not executed")
+                    print("Dry-run: skipping remote execution and timing for this configuration.")
+                    continue
+
+                completed = wait_for_completion(
+                    runner,
+                    args.master,
+                    layout,
+                    args.timeout,
+                    args.remote_root,
+                )
+                elapsed = time.monotonic() - start
+
+                if completed:
+                    result.record_success(elapsed)
+                    print(f"Run completed in {elapsed:.2f}s")
+                else:
+                    result.record_failure(f"Timeout after {elapsed:.2f}s (limit {args.timeout}s)")
+
+                kill_remote_processes(runner, kill_hosts)
 
     compute_speedups(results)
     return results
@@ -595,6 +698,10 @@ def format_results(results: List[RunResult]) -> None:
         line = (
             f"{result.machine_count} machine(s): status={result.status}"
         )
+        if result.map_max_lines is not None:
+            line += f", map_max_lines={result.map_max_lines}"
+        else:
+            line += ", map_max_lines=None"
         if result.elapsed_seconds is not None:
             line += f", elapsed={result.elapsed_seconds:.2f}s"
         if result.speedup is not None:
@@ -615,7 +722,7 @@ def main(argv: Sequence[str]) -> int:
         return 130
     format_results(results)
     if args.results_csv:
-        args_results_csv = args.results_csv + datetime.now().strftime("_%Y%m%d_%H%M%S") + ".csv"
+        args_results_csv = "".join([args.results_csv, datetime.datetime.now().strftime("_%Y-%m-%d_%H-%M-%S"), ".csv"])
         write_csv(results, args_results_csv)
         print(f"\nResults appended to {args_results_csv}")
     failures = [res for res in results if res.status != "ok"]

@@ -39,6 +39,8 @@ Cette commande exécute 4 campagnes (1, 3, 5 et 10 machines) avec 10 splits WARC
 | `--warc-dir DIR` & `--warc-template PATTERN` | Répertoire & motif des WARC. | `/cal/commoncrawl` & `CC-MAIN-20230320083513-20230320113513-{index:05d}.warc.wet` |
 | `--warc-offset K` | Décalage d’index (0 ⇒ `00000`, 1 ⇒ `00001`, etc.). | `0` |
 | `--map-max-lines L` | Nombre maximum de lignes lues par worker pendant la phase map (`client.py`). Permet de dimensionner la charge. | `None` |
+| `--map-lines-lists SPEC` | Quand `--map-max-lines` est omis, permet de définir des listes de lignes par `machine_count` (ex. `1:10000,20000;10:50000`). | `None` |
+| `--runs-per-count R` | Répéter chaque configuration (machine count) `R` fois pour moyenner les résultats. | `1` |
 | `--control-port`, `--shuffle-port-base` | Ports utilisés par master/clients. | `5374`, `6200` |
 | `--remote-python BIN` | Interpréteur python sur les machines distantes. | `python3` |
 | `--remote-root PATH` | Répertoire où copier/chercher `serveur.py` & `client.py`. | `~` |
@@ -56,7 +58,7 @@ Cette commande exécute 4 campagnes (1, 3, 5 et 10 machines) avec 10 splits WARC
 
 ## 4. Exemples complets
 
-### 4.1 30 splits avec 7 campagnes
+### 4.1 30 splits avec 7 campagnes (3 répétitions)
 
 ```bash
 python benchmark_warc.py \
@@ -64,9 +66,30 @@ python benchmark_warc.py \
   --total-workers 30 \
   --machine-counts 1,3,5,10,15,20,30 \
   --map-max-lines 1000000 \
+  --runs-per-count 3 \
   --timeout 900 \
   --results-csv warc_speedup_DATE
 ```
+
+### 4.2 Balayer plusieurs tailles de splits
+
+```bash
+python benchmark_warc.py \
+  --ssh-user blepourt-25 \
+  --total-workers 10 \
+  --machine-counts 1,3,5,10 \
+  --map-lines-lists "1:5000,20000;5:5000,20000;10:20000" \
+  --runs-per-count 2 \
+  --timeout 900 \
+  --results-csv warc_speedup_multiscale
+```
+
+> Ici, chaque `machine_count` est exécuté pour plusieurs limites de lignes, ce qui permet d’analyser l’impact de la quantité de données.
+> Détail de la syntaxe `--map-lines-lists` :
+>
+>- 1:5000,20000 ⇒ pour 1 machine, lancer deux essais avec 5 000 et 20 000 lignes max par worker.
+>- 5:5000 ⇒ pour 5 machines, un essai à 5 000 lignes max.
+>- 10:20000 ⇒ pour 10 machines, un essai à 20 000 lignes max.
 
 ### 4.2 Simulation (dry-run)
 
@@ -87,6 +110,8 @@ python benchmark_warc.py \
 Chaque ligne correspond à une campagne (n machines) et comporte :
 
 - `machine_count` : nombre de machines distinctes utilisées.
+- `run_iteration` : numéro d'essai pour ce `machine_count` (1..R).
+- `map_max_lines` : limite de lignes utilisée (vide si aucune limitation).
 - `elapsed_seconds` : durée totale.
 - `speedup` : ratio temps_1_machine / temps_N (si calculé).
 - `serial_fraction` : estimation `f` à partir de la loi d’Amdahl (pour N > 1).
