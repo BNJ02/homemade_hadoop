@@ -35,6 +35,7 @@ class MapReduceClient:
         control_port: int,
         shuffle_port_base: int,
         encoding: str,
+        max_lines: Optional[int],
     ) -> None:
         self.machine_index = machine_index
         self.worker_id = worker_id
@@ -45,6 +46,7 @@ class MapReduceClient:
         self.shuffle_base_port = shuffle_port_base
         self.shuffle_port = shuffle_port_base + machine_index
         self.encoding = encoding
+        self.max_lines = max_lines
 
         self._incoming_counts = collections.Counter()
         self._incoming_lock = threading.Lock()
@@ -191,11 +193,17 @@ class MapReduceClient:
     def _iter_words(self, path: Path) -> Iterable[str]:
         # Extraction naïve des tokens alphanumériques pour le wordcount.
         with path.open("r", encoding=self.encoding) as handle:
+            max_lines = self.max_lines
+            lines_read = 0
             for line in handle:
                 for raw_word in WORD_RE.findall(line.lower()):
                     word = raw_word.strip()
                     if word:
                         yield word
+                if max_lines is not None:
+                    lines_read += 1
+                    if lines_read >= max_lines:
+                        break
 
     # Fonction de hachage MD5 pour répartir les mots entre workers.
     def _hash_to_index(self, word: str) -> int:
@@ -335,6 +343,12 @@ def parse_args() -> argparse.Namespace:
         default="utf-8",
         help="Text encoding for split files",
     )
+    parser.add_argument(
+        "--max-lines",
+        dest="max_lines",
+        type=int,
+        help="Optional limit on the number of input lines processed during the map stage",
+    )
     return parser.parse_args()
 
 
@@ -358,6 +372,7 @@ if __name__ == "__main__":
         control_port=args.control_port,
         shuffle_port_base=args.shuffle_port_base,
         encoding=args.encoding,
+        max_lines=args.max_lines,
     )
     try:
         client.start()
