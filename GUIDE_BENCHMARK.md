@@ -4,6 +4,12 @@ Ce document explique comment exécuter des campagnes d'expériences avec `benchm
 
 ---
 
+## 0. Contexte réseau
+
+Ce guide suppose l'accès au réseau pédagogique de Télécom Paris. Les scripts communiquent directement avec les machines de l'école (dans `hosts.json`, mais modifiable pour tout autre parc de machines) assurez-vous d'être connecté au réseau interne de l'école ou via le VPN institutionnel avant de lancer les commandes.
+
+---
+
 ## 1. Pré-requis
 
 - Accès SSH aux machines du cluster (clé déjà installée pour l'utilisateur, ici `blepourt-25`).
