@@ -304,17 +304,45 @@ def is_host_reachable(host: str, timeout: float = 1.5) -> bool:
         return False
 
 
-def filter_reachable_hosts(hosts: Sequence[str]) -> tuple[List[str], List[str]]:
-    if shutil.which("ping") is None:
-        return list(hosts), []
+def filter_reachable_hosts(
+    hosts: Sequence[str],
+    required: int | None = None,
+) -> tuple[List[str], List[str], List[str]]:
+    hosts = list(hosts)
+    if required is not None and required < 0:
+        required = 0
+    ping_available = shutil.which("ping") is not None
     reachable: List[str] = []
     unreachable: List[str] = []
+    checked: List[str] = []
+
+    if not ping_available:
+        if required is None:
+            return hosts, [], []
+        reachable = hosts[:required]
+        untested = hosts[required:]
+        return reachable, [], untested
+
     for host in hosts:
+        if required is not None and len(reachable) >= required:
+            break
+        checked.append(host)
         if is_host_reachable(host):
             reachable.append(host)
         else:
             unreachable.append(host)
-    return reachable, unreachable
+
+    if required is None:
+        # ping the full list
+        for host in hosts[len(checked) :]:
+            checked.append(host)
+            if is_host_reachable(host):
+                reachable.append(host)
+            else:
+                unreachable.append(host)
+
+    untested = [host for host in hosts if host not in checked]
+    return reachable, unreachable, untested
 
 
 def generate_warc_paths(
@@ -556,24 +584,32 @@ def launch_benchmark(args: argparse.Namespace) -> List[RunResult]:
     except ValueError as exc:
         raise ValueError(f"Invalid --map-lines-all configuration: {exc}") from exc
     host_pool = parse_csv_list(args.host_pool)
-    reachable_hosts, unreachable_hosts = filter_reachable_hosts(host_pool)
+    machine_counts = [int(value) for value in parse_csv_list(args.machine_counts)]
+    max_required_hosts = max(machine_counts) if machine_counts else 1
+    reachable_hosts, unreachable_hosts, untested_hosts = filter_reachable_hosts(
+        host_pool,
+        required=max_required_hosts,
+    )
     if unreachable_hosts:
         print(
             "[host-check] Removing unreachable hosts: "
             + ", ".join(unreachable_hosts),
             file=sys.stderr,
         )
-    if not reachable_hosts:
+    if len(reachable_hosts) < max_required_hosts:
         raise RuntimeError(
-            "No reachable workers detected in host pool after filtering."
+            f"Not enough reachable workers: needed {max_required_hosts}, "
+            f"found {len(reachable_hosts)}"
         )
-    host_pool = reachable_hosts
+    # Preserve original order by appending untested hosts after the validated ones
+    checked_set = set(reachable_hosts + unreachable_hosts)
+    remaining_hosts = [host for host in host_pool if host not in checked_set]
+    host_pool = reachable_hosts + remaining_hosts
     if not is_host_reachable(args.master):
         print(
             f"[host-check] Warning: master host {args.master} did not respond to ping.",
             file=sys.stderr,
         )
-    machine_counts = [int(value) for value in parse_csv_list(args.machine_counts)]
     warc_paths = generate_warc_paths(
         args.total_workers,
         args.warc_dir,
