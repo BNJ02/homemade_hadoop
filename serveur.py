@@ -170,41 +170,79 @@ class MasterServer:
         # Boucle principale : bloquée sur la condition tant que des événements
         # (inscription, fin de map/reduce) ne sont pas reçus.
         while not self._stop_event.is_set():
+            payload: Optional[Dict[str, object]] = None
+            clients_snapshot = []
+            post_action: Optional[str] = None
             with self._condition:
                 if not self._start_map_sent and len(self._clients) >= self.expected_workers:
-                    self._broadcast({"type": "start_map"})
+                    clients_snapshot = list(self._clients.items())
+                    payload = {"type": "start_map"}
                     self._start_map_sent = True
-                    print("\nAll workers registered. start_map sent.")
-                    continue
-                if (
+                    post_action = "start_map"
+                elif (
                     self._start_map_sent
                     and not self._start_reduce_sent
                     and len(self._map_finished) >= self.expected_workers
                 ):
-                    self._broadcast({"type": "start_reduce"})
+                    clients_snapshot = list(self._clients.items())
+                    payload = {"type": "start_reduce"}
                     self._start_reduce_sent = True
-                    print("\nAll map_finished received. start_reduce sent.")
-                    continue
-                if (
+                    post_action = "start_reduce"
+                elif (
                     self._start_reduce_sent
                     and len(self._reduce_results) >= self.expected_workers
                 ):
                     self._emit_final_result()
-                    self._broadcast({"type": "shutdown"})
+                    clients_snapshot = list(self._clients.items())
+                    payload = {"type": "shutdown"}
                     self._stop_event.set()
+                    post_action = "shutdown"
+                else:
+                    self._condition.wait()
+                    continue
+            if payload is not None:
+                self._broadcast(payload, clients_snapshot)
+                if post_action == "start_map":
+                    print("\nAll workers registered. start_map sent.")
+                elif post_action == "start_reduce":
+                    print("\nAll map_finished received. start_reduce sent.")
+                elif post_action == "shutdown":
                     return
-                self._condition.wait()
 
     # Diffuse un message à tous les clients connectés.
-    def _broadcast(self, payload: Dict[str, object]) -> None:
-        for index, info in list(self._clients.items()):
+    def _broadcast(
+        self,
+        payload: Dict[str, object],
+        clients_snapshot: Optional[list[Tuple[int, ClientInfo]]] = None,
+    ) -> None:
+        if clients_snapshot is None:
+            clients_snapshot = []
+        failed: list[Tuple[int, ClientInfo]] = []
+        for index, info in clients_snapshot:
             try:
                 with info.lock:
                     send_json(info.sock, payload)
             except OSError:
                 print(f"Failed to send to worker {index}, closing connection")
+                failed.append((index, info))
+        if failed:
+            self._remove_failed_clients(failed)
+
+    def _remove_failed_clients(self, failed: list[Tuple[int, ClientInfo]]) -> None:
+        for _, info in failed:
+            try:
                 info.sock.close()
-                self._clients.pop(index, None)
+            except OSError:
+                pass
+        with self._condition:
+            modified = False
+            for index, info in failed:
+                existing = self._clients.get(index)
+                if existing is info:
+                    self._clients.pop(index, None)
+                    modified = True
+            if modified:
+                self._condition.notify_all()
 
     # Agrège et affiche les résultats finaux du wordcount.
     def _emit_final_result(self) -> None:
