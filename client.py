@@ -10,6 +10,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -17,8 +18,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 Chaque worker se connecte au master pour recevoir les ordres START_MAP et
 START_REDUCE. La phase map lit split_<id>.txt et répartit les mots via une
-fonction de hachage MD5%N. Les messages arrivent en parallèle via un thread
-"shuffle" dédié et sont cumulés pour la réduction locale.
+fonction de hachage configurable (CRC32 par défaut pour de meilleures
+performances). Les messages arrivent en parallèle via un thread "shuffle"
+dédié et sont cumulés pour la réduction locale.
 """
 
 WORD_RE = re.compile(r"\w+")
@@ -36,6 +38,8 @@ class MapReduceClient:
         shuffle_port_base: int,
         encoding: str,
         max_lines: Optional[int],
+        hash_name: str = "crc32",
+        flush_threshold: int = 64 * 1024,
     ) -> None:
         self.machine_index = machine_index
         self.worker_id = worker_id
@@ -47,13 +51,14 @@ class MapReduceClient:
         self.shuffle_port = shuffle_port_base + machine_index
         self.encoding = encoding
         self.max_lines = max_lines
+        self._hash_name = hash_name.lower()
 
         self._incoming_counts = collections.Counter()
         self._incoming_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._outgoing_sockets: Dict[int, socket.socket] = {}
         self._pending_frames: Dict[int, bytearray] = {}
-        self._flush_threshold = 64 * 1024
+        self._flush_threshold = max(0, flush_threshold)
         self._listener_thread: Optional[threading.Thread] = None
         self._master_socket: Optional[socket.socket] = None
 
@@ -209,13 +214,23 @@ class MapReduceClient:
                     if lines_read >= max_lines:
                         break
 
-    # Fonction de hachage MD5 pour répartir les mots entre workers.
+    # Fonction de hachage configurable pour répartir les mots entre workers.
     def _hash_to_index(self, word: str) -> int:
-        digest = hashlib.md5(word.encode(self.encoding)).digest()
-        value = int.from_bytes(digest, byteorder="big")
+        encoded = word.encode(self.encoding)
+        if self._hash_name == "crc32":
+            value = zlib.crc32(encoded) & 0xFFFFFFFF
+        elif self._hash_name == "md5":
+            digest = hashlib.md5(encoded).digest()
+            value = int.from_bytes(digest, byteorder="big")
+        elif self._hash_name == "blake2s":
+            digest = hashlib.blake2s(encoded).digest()
+            value = int.from_bytes(digest, byteorder="big")
+        else:
+            raise ValueError(f"Unsupported hash function: {self._hash_name}")
         return value % len(self.hosts)
 
     # Envoie un mot à un autre worker (ou à soi-même).
+    # Les transmissions réseau sont mises en tampon pour limiter les appels send().
     def _send_word(self, destination: int, word: str) -> None:
         if destination == self.machine_index:
             with self._incoming_lock:
@@ -227,7 +242,7 @@ class MapReduceClient:
         buffer = self._pending_frames.setdefault(destination, bytearray())
         buffer.extend(header)
         buffer.extend(payload)
-        if len(buffer) >= self._flush_threshold:
+        if self._flush_threshold == 0 or len(buffer) >= self._flush_threshold:
             self._flush_outgoing(destination)
 
     # Obtient (ou crée) une connexion socket vers un autre worker.
@@ -380,6 +395,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Optional limit on the number of input lines processed during the map stage",
     )
+    parser.add_argument(
+        "--hash",
+        dest="hash_name",
+        choices=("crc32", "md5", "blake2s"),
+        default="crc32",
+        help=(
+            "Hash algorithm used to partition words during shuffle "
+            "(crc32 is fastest, md5/blake2s trade speed for fewer collisions)"
+        ),
+    )
+    parser.add_argument(
+        "--flush-threshold",
+        dest="flush_threshold",
+        type=int,
+        default=64 * 1024,
+        help="Bytes to batch before flushing shuffle sockets (0 to flush immediately)",
+    )
     return parser.parse_args()
 
 
@@ -404,6 +436,8 @@ if __name__ == "__main__":
         shuffle_port_base=args.shuffle_port_base,
         encoding=args.encoding,
         max_lines=args.max_lines,
+        hash_name=args.hash_name,
+        flush_threshold=args.flush_threshold,
     )
     try:
         client.start()
