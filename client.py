@@ -52,6 +52,8 @@ class MapReduceClient:
         self._incoming_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._outgoing_sockets: Dict[int, socket.socket] = {}
+        self._pending_frames: Dict[int, bytearray] = {}
+        self._flush_threshold = 64 * 1024
         self._listener_thread: Optional[threading.Thread] = None
         self._master_socket: Optional[socket.socket] = None
 
@@ -177,6 +179,7 @@ class MapReduceClient:
         except Exception as exc:  # pylint: disable=broad-except
             return False, str(exc)
         finally:
+            self._flush_all_outgoing()
             self._close_outgoing()
 
     # Réduit les paires (mot, count) accumulées localement.
@@ -219,7 +222,12 @@ class MapReduceClient:
             return
         sock = self._get_outgoing_socket(destination)
         payload = word.encode(self.encoding)
-        self._send_frame(sock, payload)
+        header = struct.pack(">I", len(payload))
+        buffer = self._pending_frames.setdefault(destination, bytearray())
+        buffer.extend(header)
+        buffer.extend(payload)
+        if len(buffer) >= self._flush_threshold:
+            self._flush_outgoing(destination)
 
     # Obtient (ou crée) une connexion socket vers un autre worker.
     def _get_outgoing_socket(self, destination: int) -> socket.socket:
@@ -240,14 +248,34 @@ class MapReduceClient:
         self._outgoing_sockets[destination] = sock
         return sock
 
+    def _flush_outgoing(self, destination: int) -> None:
+        buffer = self._pending_frames.get(destination)
+        if not buffer:
+            return
+        sock = self._outgoing_sockets.get(destination)
+        if sock is None:
+            sock = self._get_outgoing_socket(destination)
+        if not buffer:
+            return
+        try:
+            sock.sendall(buffer)
+        finally:
+            buffer.clear()
+
+    def _flush_all_outgoing(self) -> None:
+        for destination in list(self._pending_frames.keys()):
+            self._flush_outgoing(destination)
+
     # Ferme toutes les connexions sortantes.
     def _close_outgoing(self) -> None:
-        for sock in self._outgoing_sockets.values():
+        self._flush_all_outgoing()
+        for destination, sock in list(self._outgoing_sockets.items()):
             try:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             sock.close()
+            self._pending_frames.pop(destination, None)
         self._outgoing_sockets.clear()
 
     # Consomme un flux de paires (mot, 1) en provenance d'un autre worker.
