@@ -85,6 +85,7 @@ class MapReduceClient:
                         conn, _ = server_sock.accept()
                     except socket.timeout:
                         continue
+                    conn.settimeout(1.0)
                     threading.Thread(
                         target=self._consume_shuffle_stream,
                         args=(conn,),
@@ -254,13 +255,18 @@ class MapReduceClient:
     def _consume_shuffle_stream(self, conn: socket.socket) -> None:
         with conn:
             while not self._shutdown_event.is_set():
-                length_bytes = self._recv_exact(conn, 4)
-                if not length_bytes:
-                    break
-                size = struct.unpack(">I", length_bytes)[0]
-                payload = self._recv_exact(conn, size)
-                if not payload:
-                    break
+                try:
+                    length_bytes = self._recv_exact(conn, 4)
+                    if not length_bytes:
+                        break
+                    size = struct.unpack(">I", length_bytes)[0]
+                    payload = self._recv_exact(conn, size)
+                    if not payload:
+                        break
+                except socket.timeout:
+                    if self._shutdown_event.is_set():
+                        break
+                    continue
                 word = payload.decode(self.encoding)
                 if not word:
                     continue
@@ -276,10 +282,7 @@ class MapReduceClient:
     def _recv_exact(self, sock: socket.socket, size: int) -> Optional[bytes]:
         data = b""
         while len(data) < size:
-            try:
-                chunk = sock.recv(size - len(data))
-            except socket.timeout:
-                continue
+            chunk = sock.recv(size - len(data))
             if not chunk:
                 return None
             data += chunk
