@@ -40,6 +40,9 @@ class MapReduceClient:
         max_lines: Optional[int],
         hash_name: str = "crc32",
         flush_threshold: int = 64 * 1024,
+        conn_timeout: Optional[float] = 5.0,
+        sock_timeout: Optional[float] = 5.0,
+        recv_deadline: Optional[float] = 30.0,
     ) -> None:
         self.machine_index = machine_index
         self.worker_id = worker_id
@@ -52,6 +55,11 @@ class MapReduceClient:
         self.encoding = encoding
         self.max_lines = max_lines
         self._hash_name = hash_name.lower()
+        self._conn_timeout = conn_timeout if conn_timeout and conn_timeout > 0 else None
+        self._sock_timeout = sock_timeout if sock_timeout and sock_timeout > 0 else None
+        self._recv_deadline = (
+            recv_deadline if recv_deadline and recv_deadline > 0 else None
+        )
 
         self._incoming_counts = collections.Counter()
         self._incoming_lock = threading.Lock()
@@ -92,7 +100,7 @@ class MapReduceClient:
                         conn, _ = server_sock.accept()
                     except socket.timeout:
                         continue
-                    conn.settimeout(1.0)
+                    self._configure_connected_socket(conn)
                     threading.Thread(
                         target=self._consume_shuffle_stream,
                         args=(conn,),
@@ -115,8 +123,15 @@ class MapReduceClient:
 
     # Connexion au master et enregistrement
     def _connect_master(self) -> None:
-        self._master_socket = socket.create_connection((self.master_host, self.control_port))
-        self._master_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if self._conn_timeout is None:
+            self._master_socket = socket.create_connection(
+                (self.master_host, self.control_port)
+            )
+        else:
+            self._master_socket = socket.create_connection(
+                (self.master_host, self.control_port), timeout=self._conn_timeout
+            )
+        self._configure_connected_socket(self._master_socket)
         register_payload = {
             "type": "register",
             "machine_index": self.worker_id,
@@ -129,7 +144,15 @@ class MapReduceClient:
     def _control_loop(self) -> None:
         assert self._master_socket is not None
         while not self._shutdown_event.is_set():
-            message = self._recv_control()
+            try:
+                message = self._recv_control()
+            except TimeoutError:
+                print(
+                    f"[worker {self.worker_id}] Control connection receive deadline exceeded",
+                    file=sys.stderr,
+                )
+                self._shutdown_event.set()
+                break
             if message is None:
                 break
             msg_type = message.get("type")
@@ -254,13 +277,16 @@ class MapReduceClient:
         port = self.shuffle_base_port + destination
         for attempt in range(5):
             try:
-                sock = socket.create_connection((host, port), timeout=5.0)
+                if self._conn_timeout is None:
+                    sock = socket.create_connection((host, port))
+                else:
+                    sock = socket.create_connection((host, port), timeout=self._conn_timeout)
                 break
             except OSError:
                 if attempt == 4:
                     raise
                 time.sleep(0.2)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._configure_connected_socket(sock)
         self._outgoing_sockets[destination] = sock
         return sock
 
@@ -294,6 +320,42 @@ class MapReduceClient:
             self._pending_frames.pop(destination, None)
         self._outgoing_sockets.clear()
 
+    def _configure_connected_socket(self, sock: socket.socket) -> None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        self._enable_keepalive(sock)
+        timeout = self._sock_timeout
+        if timeout is None and self._recv_deadline is not None:
+            timeout = self._recv_deadline
+        if timeout is None:
+            sock.settimeout(None)
+        else:
+            sock.settimeout(timeout)
+
+    def _enable_keepalive(self, sock: socket.socket) -> None:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            return
+        keepalive_options = [
+            (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPIDLE", None), 60),
+            (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPINTVL", None), 10),
+            (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPCNT", None), 5),
+        ]
+        if hasattr(socket, "TCP_KEEPALIVE"):
+            keepalive_options.append(
+                (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE"), 60)
+            )
+        for level, opt, value in keepalive_options:
+            if opt is None:
+                continue
+            try:
+                sock.setsockopt(level, opt, value)
+            except OSError:
+                continue
+
     # Consomme un flux de paires (mot, 1) en provenance d'un autre worker.
     def _consume_shuffle_stream(self, conn: socket.socket) -> None:
         with conn:
@@ -306,10 +368,13 @@ class MapReduceClient:
                     payload = self._recv_exact(conn, size)
                     if not payload:
                         break
-                except socket.timeout:
-                    if self._shutdown_event.is_set():
-                        break
-                    continue
+                except TimeoutError:
+                    print(
+                        f"[worker {self.worker_id}] Shuffle stream receive deadline exceeded",
+                        file=sys.stderr,
+                    )
+                    self._shutdown_event.set()
+                    break
                 word = payload.decode(self.encoding)
                 if not word:
                     continue
@@ -323,13 +388,25 @@ class MapReduceClient:
 
     # Réception de données exactes
     def _recv_exact(self, sock: socket.socket, size: int) -> Optional[bytes]:
-        data = b""
+        data = bytearray()
+        deadline = None
+        if self._recv_deadline is not None:
+            deadline = time.monotonic() + self._recv_deadline
         while len(data) < size:
-            chunk = sock.recv(size - len(data))
+            if self._shutdown_event.is_set():
+                return None
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("receive deadline exceeded")
+            try:
+                chunk = sock.recv(size - len(data))
+            except socket.timeout:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("receive deadline exceeded")
+                continue
             if not chunk:
                 return None
-            data += chunk
-        return data
+            data.extend(chunk)
+        return bytes(data)
 
     # Envoi des messages de contrôle au master
     def _send_control(self, payload: Dict[str, object]) -> None:
@@ -412,6 +489,27 @@ def parse_args() -> argparse.Namespace:
         default=64 * 1024,
         help="Bytes to batch before flushing shuffle sockets (0 to flush immediately)",
     )
+    parser.add_argument(
+        "--conn-timeout",
+        dest="conn_timeout",
+        type=float,
+        default=5.0,
+        help="Seconds to wait when establishing connections (0 to disable)",
+    )
+    parser.add_argument(
+        "--sock-timeout",
+        dest="sock_timeout",
+        type=float,
+        default=5.0,
+        help="Per-socket timeout for operations once connected (0 for blocking)",
+    )
+    parser.add_argument(
+        "--recv-deadline",
+        dest="recv_deadline",
+        type=float,
+        default=30.0,
+        help="Overall deadline for receiving an entire frame (0 to disable)",
+    )
     return parser.parse_args()
 
 
@@ -438,6 +536,9 @@ if __name__ == "__main__":
         max_lines=args.max_lines,
         hash_name=args.hash_name,
         flush_threshold=args.flush_threshold,
+        conn_timeout=args.conn_timeout,
+        sock_timeout=args.sock_timeout,
+        recv_deadline=args.recv_deadline,
     )
     try:
         client.start()
