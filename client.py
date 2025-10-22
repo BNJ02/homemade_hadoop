@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import queue
 import hashlib
 import json
 import re
@@ -57,16 +58,25 @@ class MapReduceClient:
         self._incoming_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._outgoing_sockets: Dict[int, socket.socket] = {}
-        self._pending_frames: Dict[int, bytearray] = {}
+        self._outgoing_queues: Dict[int, queue.Queue] = {}
+        self._sender_threads: List[threading.Thread] = []
+        self._queue_flush_token = object()
+        self._queue_stop_token = object()
         self._flush_threshold = max(0, flush_threshold)
         self._listener_thread: Optional[threading.Thread] = None
         self._master_socket: Optional[socket.socket] = None
+
+        for destination in range(len(self.hosts)):
+            if destination == self.machine_index:
+                continue
+            self._outgoing_queues[destination] = queue.Queue()
 
     # Boucle principale du client
     def start(self) -> None:
         # Démarre l'écoute shuffle avant d'informer le master pour garantir
         # que les autres workers peuvent nous pousser des clés immédiatement.
         self._start_shuffle_listener()
+        self._start_sender_threads()
         self._connect_master()
         try:
             self._control_loop()
@@ -101,6 +111,19 @@ class MapReduceClient:
 
         self._listener_thread = threading.Thread(target=run_listener, daemon=True)
         self._listener_thread.start()
+
+    def _start_sender_threads(self) -> None:
+        if self._sender_threads:
+            return
+
+        for destination in sorted(self._outgoing_queues):
+            thread = threading.Thread(
+                target=self._run_sender,
+                args=(destination,),
+                daemon=True,
+            )
+            self._sender_threads.append(thread)
+            thread.start()
 
     # Force la terminaison du thread d'écoute.
     def _poke_listener(self) -> None:
@@ -169,7 +192,9 @@ class MapReduceClient:
             # Vider d'abord les accumulations pour ne pas mélanger deux jobs.
             with self._incoming_lock:
                 self._incoming_counts.clear()
-            
+
+            self._start_sender_threads()
+
             # If split_id contains a path separator, use it as-is, otherwise use split_X.txt format
             if "/" in self.split_id:
                 path = Path(self.split_id)
@@ -236,14 +261,8 @@ class MapReduceClient:
             with self._incoming_lock:
                 self._incoming_counts[word] += 1
             return
-        sock = self._get_outgoing_socket(destination)
-        payload = word.encode(self.encoding)
-        header = struct.pack(">I", len(payload))
-        buffer = self._pending_frames.setdefault(destination, bytearray())
-        buffer.extend(header)
-        buffer.extend(payload)
-        if self._flush_threshold == 0 or len(buffer) >= self._flush_threshold:
-            self._flush_outgoing(destination)
+        queue_ = self._outgoing_queues[destination]
+        queue_.put((word, destination))
 
     # Obtient (ou crée) une connexion socket vers un autre worker.
     def _get_outgoing_socket(self, destination: int) -> socket.socket:
@@ -264,34 +283,31 @@ class MapReduceClient:
         self._outgoing_sockets[destination] = sock
         return sock
 
-    def _flush_outgoing(self, destination: int) -> None:
-        buffer = self._pending_frames.get(destination)
-        if not buffer:
-            return
-        sock = self._outgoing_sockets.get(destination)
-        if sock is None:
-            sock = self._get_outgoing_socket(destination)
-        if not buffer:
-            return
-        try:
-            sock.sendall(buffer)
-        finally:
-            buffer.clear()
-
     def _flush_all_outgoing(self) -> None:
-        for destination in list(self._pending_frames.keys()):
-            self._flush_outgoing(destination)
+        if not self._sender_threads:
+            return
+        for queue_ in self._outgoing_queues.values():
+            queue_.put(self._queue_flush_token)
+        for queue_ in self._outgoing_queues.values():
+            queue_.join()
 
     # Ferme toutes les connexions sortantes.
     def _close_outgoing(self) -> None:
-        self._flush_all_outgoing()
+        if self._sender_threads:
+            self._flush_all_outgoing()
+            for queue_ in self._outgoing_queues.values():
+                queue_.put(self._queue_stop_token)
+            for queue_ in self._outgoing_queues.values():
+                queue_.join()
+            for thread in self._sender_threads:
+                thread.join(timeout=1.0)
+            self._sender_threads.clear()
         for destination, sock in list(self._outgoing_sockets.items()):
             try:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             sock.close()
-            self._pending_frames.pop(destination, None)
         self._outgoing_sockets.clear()
 
     # Consomme un flux de paires (mot, 1) en provenance d'un autre worker.
@@ -348,6 +364,45 @@ class MapReduceClient:
         if not payload:
             return None
         return json.loads(payload.decode(self.encoding))
+
+    def _run_sender(self, destination: int) -> None:
+        queue_ = self._outgoing_queues[destination]
+        buffer = bytearray()
+        while True:
+            item = queue_.get()
+            try:
+                if item is self._queue_stop_token:
+                    if buffer:
+                        self._send_buffer(destination, buffer)
+                    break
+                if item is self._queue_flush_token:
+                    if buffer:
+                        self._send_buffer(destination, buffer)
+                    continue
+                word, dest = item
+                if dest != destination:
+                    continue
+                payload = word.encode(self.encoding)
+                header = struct.pack(">I", len(payload))
+                buffer.extend(header)
+                buffer.extend(payload)
+                if self._flush_threshold == 0 or len(buffer) >= self._flush_threshold:
+                    self._send_buffer(destination, buffer)
+            finally:
+                queue_.task_done()
+        if buffer:
+            self._send_buffer(destination, buffer)
+
+    def _send_buffer(self, destination: int, buffer: bytearray) -> None:
+        if not buffer:
+            return
+        sock = self._outgoing_sockets.get(destination)
+        if sock is None:
+            sock = self._get_outgoing_socket(destination)
+        try:
+            sock.sendall(buffer)
+        finally:
+            buffer.clear()
 
 # Analyse des arguments de la ligne de commande
 def parse_args() -> argparse.Namespace:
