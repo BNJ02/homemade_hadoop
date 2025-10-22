@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import zlib
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -40,6 +41,7 @@ class MapReduceClient:
         max_lines: Optional[int],
         hash_name: str = "crc32",
         flush_threshold: int = 64 * 1024,
+        map_workers: int = 1,
     ) -> None:
         self.machine_index = machine_index
         self.worker_id = worker_id
@@ -61,6 +63,7 @@ class MapReduceClient:
         self._flush_threshold = max(0, flush_threshold)
         self._listener_thread: Optional[threading.Thread] = None
         self._master_socket: Optional[socket.socket] = None
+        self._map_workers = max(1, map_workers)
 
     # Boucle principale du client
     def start(self) -> None:
@@ -178,9 +181,60 @@ class MapReduceClient:
             
             if not path.exists():
                 raise FileNotFoundError(f"split file missing: {path}")
-            for word in self._iter_words(path):
-                destination = self._hash_to_index(word)
-                self._send_word(destination, word)
+
+            use_parallel = self._map_workers > 1
+            hosts_len = len(self.hosts)
+            if use_parallel and self.max_lines is not None:
+                print(
+                    f"[worker {self.worker_id}] Parallel map disabled because max_lines is set",
+                    file=sys.stderr,
+                )
+                use_parallel = False
+
+            file_size = path.stat().st_size
+            if use_parallel and file_size == 0:
+                use_parallel = False
+            if use_parallel and file_size // self._map_workers < 1024:
+                print(
+                    f"[worker {self.worker_id}] Parallel map disabled because split file is too small",
+                    file=sys.stderr,
+                )
+                use_parallel = False
+
+            offsets: List[Tuple[int, int]] = []
+            if use_parallel:
+                offsets = self._compute_chunk_offsets(path, self._map_workers)
+                if len(offsets) <= 1:
+                    print(
+                        f"[worker {self.worker_id}] Parallel map disabled due to insufficient chunk boundaries",
+                        file=sys.stderr,
+                    )
+                    use_parallel = False
+
+            if use_parallel:
+                with ProcessPoolExecutor(max_workers=self._map_workers) as executor:
+                    futures = [
+                        executor.submit(
+                            MapReduceClient._process_chunk,
+                            path,
+                            start,
+                            end,
+                            self.encoding,
+                            self._hash_name,
+                            hosts_len,
+                        )
+                        for start, end in offsets
+                        if start < end
+                    ]
+                    for future in futures:
+                        chunk_counts = future.result()
+                        for destination, counter in chunk_counts.items():
+                            for word, count in counter.items():
+                                self._send_count(destination, word, count)
+            else:
+                for word in self._iter_words(path):
+                    destination = self._hash_to_index(word)
+                    self._send_word(destination, word)
             return True, None
         except Exception as exc:  # pylint: disable=broad-except
             return False, str(exc)
@@ -214,34 +268,118 @@ class MapReduceClient:
                     if lines_read >= max_lines:
                         break
 
+    @staticmethod
+    def _compute_chunk_offsets(path: Path, workers: int) -> List[Tuple[int, int]]:
+        size = path.stat().st_size
+        if workers <= 1 or size == 0:
+            return [(0, size)]
+        chunk_size = max(1, size // workers)
+        offsets: List[Tuple[int, int]] = []
+        start = 0
+        with path.open("rb") as handle:
+            for _ in range(workers - 1):
+                target = start + chunk_size
+                if target >= size:
+                    break
+                handle.seek(target)
+                handle.readline()
+                end = handle.tell()
+                if end <= start:
+                    break
+                offsets.append((start, end))
+                start = end
+        offsets.append((start, size))
+        return offsets
+
+    @staticmethod
+    def _process_chunk(
+        path: Path,
+        start: int,
+        end: int,
+        encoding: str,
+        hash_name: str,
+        hosts_len: int,
+    ) -> Dict[int, collections.Counter]:
+        file_path = Path(path)
+        size = file_path.stat().st_size
+        start = max(0, min(start, size))
+        end = max(start, min(end, size))
+        counters: Dict[int, collections.Counter] = {}
+        with file_path.open("rb") as handle:
+            if start > 0:
+                handle.seek(start - 1)
+                if handle.read(1) != b"\n":
+                    handle.readline()
+                start = handle.tell()
+            else:
+                handle.seek(start)
+
+            if end < size:
+                handle.seek(end)
+                handle.readline()
+                end = handle.tell()
+            else:
+                end = size
+
+            handle.seek(start)
+            while handle.tell() < end:
+                line = handle.readline()
+                if not line:
+                    break
+                current_pos = handle.tell()
+                if current_pos > end and not line.endswith(b"\n"):
+                    break
+                text = line.decode(encoding)
+                for raw_word in WORD_RE.findall(text.lower()):
+                    word = raw_word.strip()
+                    if not word:
+                        continue
+                    value = MapReduceClient._hash_value(word, encoding, hash_name)
+                    destination = value % hosts_len
+                    counter = counters.get(destination)
+                    if counter is None:
+                        counter = collections.Counter()
+                        counters[destination] = counter
+                    counter[word] += 1
+        return counters
+
     # Fonction de hachage configurable pour répartir les mots entre workers.
     def _hash_to_index(self, word: str) -> int:
-        encoded = word.encode(self.encoding)
-        if self._hash_name == "crc32":
+        value = self._hash_value(word, self.encoding, self._hash_name)
+        return value % len(self.hosts)
+
+    @staticmethod
+    def _hash_value(word: str, encoding: str, hash_name: str) -> int:
+        encoded = word.encode(encoding)
+        if hash_name == "crc32":
             value = zlib.crc32(encoded) & 0xFFFFFFFF
-        elif self._hash_name == "md5":
+        elif hash_name == "md5":
             digest = hashlib.md5(encoded).digest()
             value = int.from_bytes(digest, byteorder="big")
-        elif self._hash_name == "blake2s":
+        elif hash_name == "blake2s":
             digest = hashlib.blake2s(encoded).digest()
             value = int.from_bytes(digest, byteorder="big")
         else:
-            raise ValueError(f"Unsupported hash function: {self._hash_name}")
-        return value % len(self.hosts)
+            raise ValueError(f"Unsupported hash function: {hash_name}")
+        return value
 
     # Envoie un mot à un autre worker (ou à soi-même).
     # Les transmissions réseau sont mises en tampon pour limiter les appels send().
     def _send_word(self, destination: int, word: str) -> None:
+        self._send_count(destination, word, 1)
+
+    def _send_count(self, destination: int, word: str, count: int) -> None:
+        if count <= 0:
+            return
         if destination == self.machine_index:
             with self._incoming_lock:
-                self._incoming_counts[word] += 1
+                self._incoming_counts[word] += count
             return
-        sock = self._get_outgoing_socket(destination)
         payload = word.encode(self.encoding)
         header = struct.pack(">I", len(payload))
+        frame = header + payload
         buffer = self._pending_frames.setdefault(destination, bytearray())
-        buffer.extend(header)
-        buffer.extend(payload)
+        buffer.extend(frame * count)
         if self._flush_threshold == 0 or len(buffer) >= self._flush_threshold:
             self._flush_outgoing(destination)
 
@@ -412,6 +550,13 @@ def parse_args() -> argparse.Namespace:
         default=64 * 1024,
         help="Bytes to batch before flushing shuffle sockets (0 to flush immediately)",
     )
+    parser.add_argument(
+        "--map-workers",
+        dest="map_workers",
+        type=int,
+        default=1,
+        help="Local processes used to parallelize the map stage",
+    )
     return parser.parse_args()
 
 
@@ -438,6 +583,7 @@ if __name__ == "__main__":
         max_lines=args.max_lines,
         hash_name=args.hash_name,
         flush_threshold=args.flush_threshold,
+        map_workers=args.map_workers,
     )
     try:
         client.start()

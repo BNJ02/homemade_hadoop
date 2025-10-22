@@ -56,6 +56,11 @@ Ce dépôt montre une version simplifiée d'un traitement MapReduce de type
   si l'identifiant du worker ne correspond pas au suffixe du split.
 - Les ports contrôles et shuffle sont configurables via `--control-port` et
   `--shuffle-port-base`.
+- L'option `--map-workers` de `client.py` active un découpage local du split
+  et répartit la lecture entre plusieurs processus (par défaut 1). La
+  parallélisation s'applique uniquement lorsque `--max-lines` est désactivé et
+  que le fichier contient suffisamment de données pour générer plusieurs
+  segments.
 
 ## Validation parallèle
 
@@ -70,3 +75,19 @@ Le parallélisme provient de deux éléments principaux :
 
 Pour déboguer, activer des prints supplémentaires dans `client.py` ou
 inspecter les fichiers `mapreduce_worker_*.log`.
+
+## Parallélisation locale de la phase map
+
+Pour saturer plusieurs cœurs d'une même machine, lancer `client.py` avec
+`--map-workers N` (par exemple `N=4`). Le split est alors découpé en segments
+équilibrés en respectant les limites de lignes, chaque segment étant traité
+par un processus fils. Les résultats intermédiaires sont combinés côté client
+avant envoi, ce qui évite de modifier le protocole shuffle.
+
+Lorsque `--max-lines` est utilisé ou que le fichier est trop petit pour
+justifier la découpe, le client affiche un message et revient automatiquement
+au traitement séquentiel.
+
+Pour vérifier la répartition de la charge CPU, lancer un `htop`/`top` sur le
+worker pendant la phase map : les processus enfants `python3` doivent tous
+consommer du CPU en parallèle tant que la lecture du split n'est pas terminée.
