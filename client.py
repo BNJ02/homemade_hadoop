@@ -40,6 +40,7 @@ class MapReduceClient:
         max_lines: Optional[int],
         hash_name: str = "crc32",
         flush_threshold: int = 64 * 1024,
+        local_flush_threshold: int = 1024,
     ) -> None:
         self.machine_index = machine_index
         self.worker_id = worker_id
@@ -59,6 +60,9 @@ class MapReduceClient:
         self._outgoing_sockets: Dict[int, socket.socket] = {}
         self._pending_frames: Dict[int, bytearray] = {}
         self._flush_threshold = max(0, flush_threshold)
+        self._local_buffer = collections.Counter()
+        self._local_buffer_total = 0
+        self._local_flush_threshold = max(0, local_flush_threshold)
         self._listener_thread: Optional[threading.Thread] = None
         self._master_socket: Optional[socket.socket] = None
 
@@ -169,6 +173,8 @@ class MapReduceClient:
             # Vider d'abord les accumulations pour ne pas mélanger deux jobs.
             with self._incoming_lock:
                 self._incoming_counts.clear()
+            self._local_buffer.clear()
+            self._local_buffer_total = 0
             
             # If split_id contains a path separator, use it as-is, otherwise use split_X.txt format
             if "/" in self.split_id:
@@ -185,12 +191,14 @@ class MapReduceClient:
         except Exception as exc:  # pylint: disable=broad-except
             return False, str(exc)
         finally:
+            self._flush_local_buffer()
             self._flush_all_outgoing()
             self._close_outgoing()
 
     # Réduit les paires (mot, count) accumulées localement.
     def _run_reduce_stage(self) -> Tuple[Optional[List[Tuple[str, int]]], Optional[str]]:
         try:
+            self._flush_local_buffer()
             with self._incoming_lock:
                 snapshot = list(self._incoming_counts.items())
             snapshot.sort()
@@ -233,8 +241,13 @@ class MapReduceClient:
     # Les transmissions réseau sont mises en tampon pour limiter les appels send().
     def _send_word(self, destination: int, word: str) -> None:
         if destination == self.machine_index:
-            with self._incoming_lock:
-                self._incoming_counts[word] += 1
+            self._local_buffer[word] += 1
+            self._local_buffer_total += 1
+            if (
+                self._local_flush_threshold == 0
+                or self._local_buffer_total >= self._local_flush_threshold
+            ):
+                self._flush_local_buffer()
             return
         sock = self._get_outgoing_socket(destination)
         payload = word.encode(self.encoding)
@@ -281,6 +294,15 @@ class MapReduceClient:
     def _flush_all_outgoing(self) -> None:
         for destination in list(self._pending_frames.keys()):
             self._flush_outgoing(destination)
+
+    def _flush_local_buffer(self) -> None:
+        if not self._local_buffer_total:
+            return
+        with self._incoming_lock:
+            for word, count in self._local_buffer.items():
+                self._incoming_counts[word] += count
+        self._local_buffer.clear()
+        self._local_buffer_total = 0
 
     # Ferme toutes les connexions sortantes.
     def _close_outgoing(self) -> None:
@@ -412,6 +434,16 @@ def parse_args() -> argparse.Namespace:
         default=64 * 1024,
         help="Bytes to batch before flushing shuffle sockets (0 to flush immediately)",
     )
+    parser.add_argument(
+        "--local-flush-threshold",
+        dest="local_flush_threshold",
+        type=int,
+        default=1024,
+        help=(
+            "Number of locally owned words to buffer before merging into the reduce "
+            "counter (0 to flush immediately)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -438,6 +470,7 @@ if __name__ == "__main__":
         max_lines=args.max_lines,
         hash_name=args.hash_name,
         flush_threshold=args.flush_threshold,
+        local_flush_threshold=args.local_flush_threshold,
     )
     try:
         client.start()
