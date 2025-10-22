@@ -98,6 +98,24 @@ SHUFFLE_BASE=7000      # base pour (7000 + worker_id - 1)
 
 Assurez-vous que les pare-feu autorisent ces ports.
 
+### 4.4 Exploiter plusieurs cœurs sur un worker
+
+Sur les splits volumineux, vous pouvez paralléliser la lecture locale en
+ajoutant `--map-workers N` (par exemple `--map-workers 4`) au lancement de
+`client.py`. Chaque worker découpe alors son fichier en segments équilibrés et
+les traite via un pool de processus.
+
+Contraintes :
+
+- laisser `--max-lines` désactivé ;
+- disposer d'un fichier suffisamment gros pour générer plusieurs segments,
+  sinon le client revient automatiquement au chemin séquentiel et affiche un
+  message.
+
+Pour observer la montée en charge, connectez-vous sur le worker pendant la
+phase map et lancez `htop` : plusieurs processus `python3` doivent consommer du
+CPU simultanément.
+
 ---
 
 ## 5. Surveillance & diagnostic
